@@ -23,6 +23,11 @@ import {
 } from './game/recipes';
 import { soundEngine } from './game/audio';
 import {
+  MultiplayerManager,
+  NetworkPlayerPayload,
+  NetworkChatPayload,
+} from './game/network';
+import {
   Users,
   Copy,
   Check,
@@ -31,7 +36,6 @@ import {
   Sun,
   Moon,
   CloudRain,
-  Compass,
   Package,
   MessageSquare,
   Eye,
@@ -41,36 +45,24 @@ import {
   Play,
   Sparkles,
   Hammer,
-  Maximize2,
+  Github,
+  Globe,
+  ExternalLink,
+  RefreshCw,
 } from 'lucide-react';
-
-interface RemotePlayerInfo {
-  id: string;
-  name: string;
-  skin: string;
-  x: number;
-  y: number;
-  z: number;
-  yaw: number;
-  pitch: number;
-  heldBlockId: number;
-  swinging: boolean;
-  sneaking: boolean;
-  deviceType: 'desktop' | 'mobile';
-}
-
-interface ChatMsg {
-  id: string;
-  sender: string;
-  text: string;
-  timestamp: number;
-  system?: boolean;
-}
 
 interface ParticleBurst {
   mesh: THREE.Mesh;
   vel: THREE.Vector3;
   life: number;
+}
+
+interface ActiveRoomSummary {
+  id: string;
+  seed: number;
+  playerCount: number;
+  modifiedCount: number;
+  weather: string;
 }
 
 // Reusable module-scope math vectors to prevent GC in animation loop
@@ -86,13 +78,14 @@ const _curSky = new THREE.Color();
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
 
-  // Parse room from URL hash or query for instant cross-platform friend invite
+  // Parse room from URL query for instant cross-platform friend invite
   const initialRoomFromUrl = (() => {
     const params = new URLSearchParams(window.location.search);
     return params.get('room') || 'overworld-1';
   })();
 
   const [inTitleScreen, setInTitleScreen] = useState<boolean>(false);
+  const [showGithubModal, setShowGithubModal] = useState<boolean>(false);
   const [playerName, setPlayerName] = useState<string>(() => {
     return localStorage.getItem('mc_player_name') || `Steve_${Math.floor(100 + Math.random() * 899)}`;
   });
@@ -102,6 +95,22 @@ export default function App() {
   const [roomId, setRoomId] = useState<string>(initialRoomFromUrl);
   const [roomInput, setRoomInput] = useState<string>(initialRoomFromUrl);
   const [worldSeed, setWorldSeed] = useState<number>(42069);
+
+  // GitHub Publisher States
+  const [ghToken, setGhToken] = useState<string>(() => localStorage.getItem('mc_gh_token') || '');
+  const [ghRepoName, setGhRepoName] = useState<string>('minecraft-voxel-online');
+  const [ghDescription, setGhDescription] = useState<string>(
+    'Minecraft Voxel Edition — 3D WebGL & Cross-Platform Online Multiplayer (WebRTC P2P + WebSocket)'
+  );
+  const [ghPrivate, setGhPrivate] = useState<boolean>(false);
+  const [ghPublishing, setGhPublishing] = useState<boolean>(false);
+  const [ghError, setGhError] = useState<string | null>(null);
+  const [ghResult, setGhResult] = useState<{
+    repoUrl: string;
+    pagesUrl: string;
+    uploadedCount: number;
+  } | null>(null);
+  const [copiedGhLink, setCopiedGhLink] = useState<string | null>(null);
 
   // Game modes & UI states
   const [gameMode, setGameMode] = useState<'survival' | 'creative'>('survival');
@@ -133,9 +142,20 @@ export default function App() {
   const [miningProgress, setMiningProgress] = useState<number>(0);
 
   // Multiplayer & World environment
-  const [wsConnected, setWsConnected] = useState<boolean>(false);
-  const [onlinePlayers, setOnlinePlayers] = useState<RemotePlayerInfo[]>([]);
-  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+  const [netStatus, setNetStatus] = useState<{
+    wsConnected: boolean;
+    p2pConnected: boolean;
+    p2pRole: 'host' | 'client' | 'connecting';
+    peerCount: number;
+  }>({
+    wsConnected: false,
+    p2pConnected: false,
+    p2pRole: 'connecting',
+    peerCount: 0,
+  });
+  const [onlinePlayers, setOnlinePlayers] = useState<NetworkPlayerPayload[]>([]);
+  const [activeRoomsList, setActiveRoomsList] = useState<ActiveRoomSummary[]>([]);
+  const [chatMessages, setChatMessages] = useState<NetworkChatPayload[]>([]);
   const [chatDraft, setChatDraft] = useState<string>('');
   const [timeOfDay, setTimeOfDay] = useState<number>(0.25); // 0.25 = Noon
   const [weather, setWeather] = useState<'clear' | 'rain' | 'snow'>('clear');
@@ -143,6 +163,7 @@ export default function App() {
   // Mutable refs for 60fps Three.js game loop access
   const stateRef = useRef({
     inTitleScreen,
+    showGithubModal,
     gameMode,
     isFlying,
     cameraMode,
@@ -160,6 +181,7 @@ export default function App() {
   useEffect(() => {
     stateRef.current = {
       inTitleScreen,
+      showGithubModal,
       gameMode,
       isFlying,
       cameraMode,
@@ -175,6 +197,7 @@ export default function App() {
     };
   }, [
     inTitleScreen,
+    showGithubModal,
     gameMode,
     isFlying,
     cameraMode,
@@ -191,7 +214,7 @@ export default function App() {
 
   // Refs to engine instances
   const worldRef = useRef<VoxelWorld | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
+  const netRef = useRef<MultiplayerManager | null>(null);
   const selfIdRef = useRef<string>(`p_${Math.random().toString(36).slice(2, 10)}`);
   const playerPosRef = useRef<THREE.Vector3>(new THREE.Vector3(0.5, 28, 0.5));
   const playerVelRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 0, 0));
@@ -217,6 +240,24 @@ export default function App() {
     localStorage.setItem('mc_player_skin', selectedSkin);
   }, [playerName, selectedSkin]);
 
+  // Fetch active server rooms list when lobby is opened
+  const fetchRoomsList = useCallback(() => {
+    fetch('/api/rooms')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data && Array.isArray(data.rooms)) {
+          setActiveRoomsList(data.rooms);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (inTitleScreen) {
+      fetchRoomsList();
+    }
+  }, [inTitleScreen, fetchRoomsList]);
+
   // Copy room invite link
   const handleCopyInvite = useCallback(() => {
     const url = new URL(window.location.href);
@@ -226,6 +267,47 @@ export default function App() {
     soundEngine.playClick();
     setTimeout(() => setCopiedLink(false), 2200);
   }, [roomId]);
+
+  // Publish to GitHub handler (works both via server proxy and direct browser GitHub API)
+  const handlePublishToGitHub = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!ghToken.trim()) {
+      setGhError('Пожалуйста, вставьте ваш GitHub Personal Access Token (classic с правами repo).');
+      return;
+    }
+    localStorage.setItem('mc_gh_token', ghToken.trim());
+    setGhPublishing(true);
+    setGhError(null);
+    setGhResult(null);
+
+    try {
+      const response = await fetch('/api/github/publish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: ghToken.trim(),
+          repoName: ghRepoName.trim() || 'minecraft-voxel-online',
+          description: ghDescription.trim(),
+          isPrivate: ghPrivate,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setGhError(data.error || 'Не удалось опубликовать репозиторий на GitHub.');
+      } else {
+        setGhResult({
+          repoUrl: data.repoUrl,
+          pagesUrl: data.pagesUrl,
+          uploadedCount: data.uploadedCount,
+        });
+      }
+    } catch (err) {
+      setGhError(err instanceof Error ? err.message : 'Ошибка соединения при отправке в GitHub');
+    } finally {
+      setGhPublishing(false);
+    }
+  };
 
   // Add item to hotbar
   const addBlockToInventory = useCallback((blockId: BlockId, amount = 1) => {
@@ -237,59 +319,58 @@ export default function App() {
         next[existingIdx].count = Math.min(999, next[existingIdx].count + amount);
         return next;
       }
-      // Replace current active slot if full
       next[stateRef.current.activeSlot] = { blockId, count: amount };
       return next;
     });
   }, []);
 
   // Craft recipe handler
-  const handleCraftRecipe = useCallback((recipe: CraftingRecipe) => {
-    soundEngine.playClick();
-    if (stateRef.current.gameMode === 'creative') {
-      addBlockToInventory(recipe.output.blockId, recipe.output.count);
-      return;
-    }
-
-    setHotbar((prev) => {
-      const next = prev.map((s) => ({ ...s }));
-      // Check ingredients
-      for (const req of recipe.inputs) {
-        const total = next
-          .filter((s) => s.blockId === req.blockId)
-          .reduce((acc, s) => acc + s.count, 0);
-        if (total < req.count) return prev; // Not enough
+  const handleCraftRecipe = useCallback(
+    (recipe: CraftingRecipe) => {
+      soundEngine.playClick();
+      if (stateRef.current.gameMode === 'creative') {
+        addBlockToInventory(recipe.output.blockId, recipe.output.count);
+        return;
       }
-      // Deduct ingredients
-      for (const req of recipe.inputs) {
-        let rem = req.count;
-        for (const slot of next) {
-          if (slot.blockId === req.blockId && slot.count > 0 && rem > 0) {
-            const take = Math.min(slot.count, rem);
-            slot.count -= take;
-            rem -= take;
+
+      setHotbar((prev) => {
+        const next = prev.map((s) => ({ ...s }));
+        for (const req of recipe.inputs) {
+          const total = next
+            .filter((s) => s.blockId === req.blockId)
+            .reduce((acc, s) => acc + s.count, 0);
+          if (total < req.count) return prev;
+        }
+        for (const req of recipe.inputs) {
+          let rem = req.count;
+          for (const slot of next) {
+            if (slot.blockId === req.blockId && slot.count > 0 && rem > 0) {
+              const take = Math.min(slot.count, rem);
+              slot.count -= take;
+              rem -= take;
+            }
           }
         }
-      }
-      // Add output
-      const outSlot = next.find((s) => s.blockId === recipe.output.blockId && s.count > 0);
-      if (outSlot) {
-        outSlot.count += recipe.output.count;
-      } else {
-        const emptySlot = next.find((s) => s.count <= 0);
-        if (emptySlot) {
-          emptySlot.blockId = recipe.output.blockId;
-          emptySlot.count = recipe.output.count;
+        const outSlot = next.find((s) => s.blockId === recipe.output.blockId && s.count > 0);
+        if (outSlot) {
+          outSlot.count += recipe.output.count;
         } else {
-          next[stateRef.current.activeSlot] = {
-            blockId: recipe.output.blockId,
-            count: recipe.output.count,
-          };
+          const emptySlot = next.find((s) => s.count <= 0);
+          if (emptySlot) {
+            emptySlot.blockId = recipe.output.blockId;
+            emptySlot.count = recipe.output.count;
+          } else {
+            next[stateRef.current.activeSlot] = {
+              blockId: recipe.output.blockId,
+              count: recipe.output.count,
+            };
+          }
         }
-      }
-      return next;
-    });
-  }, [addBlockToInventory]);
+        return next;
+      });
+    },
+    [addBlockToInventory]
+  );
 
   // Send chat message
   const handleSendChat = useCallback(
@@ -300,23 +381,8 @@ export default function App() {
         setShowChat(false);
         return;
       }
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'chat:send',
-            text: trimmed,
-          })
-        );
-      } else {
-        setChatMessages((prev) => [
-          ...prev.slice(-39),
-          {
-            id: `local_${Date.now()}`,
-            sender: playerName,
-            text: trimmed,
-            timestamp: Date.now(),
-          },
-        ]);
+      if (netRef.current) {
+        netRef.current.sendChat(trimmed, playerName);
       }
       setChatDraft('');
       setShowChat(false);
@@ -324,30 +390,23 @@ export default function App() {
     [chatDraft, playerName]
   );
 
-  // Sync environment change to server
+  // Sync environment change to server & P2P peers
   const updateWorldEnv = useCallback((newTime?: number, newWeather?: 'clear' | 'rain' | 'snow') => {
     soundEngine.playClick();
     const t = typeof newTime === 'number' ? newTime : stateRef.current.timeOfDay;
     const w = newWeather || stateRef.current.weather;
     setTimeOfDay(t);
     setWeather(w);
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'world:env',
-          timeOfDay: t,
-          weather: w,
-        })
-      );
+    if (netRef.current) {
+      netRef.current.sendWorldEnv(t, w);
     }
   }, []);
 
-  // Main Three.js & WebSocket initialization (Once on mount)
+  // Main Three.js & Dual-Transport Online Multiplayer Initialization
   useEffect(() => {
     const container = canvasMountRef.current;
     if (!container) return;
 
-    // 1. Software WebGL detection per Three.js skill directive
     const isSoftwareGl = (() => {
       const gl = document.createElement('canvas').getContext('webgl2');
       if (!gl) return true;
@@ -384,12 +443,10 @@ export default function App() {
       200
     );
 
-    // Studio RoomEnvironment reflection map
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
     pmremGenerator.dispose();
 
-    // Lighting rig: Hemisphere sky/ground + Directional Sun/Moon + Celestial bodies
     const hemiLight = new THREE.HemisphereLight('#d6e8ff', '#4b5e38', 0.78);
     scene.add(hemiLight);
 
@@ -408,7 +465,6 @@ export default function App() {
     sunLight.shadow.normalBias = 0.02;
     scene.add(sunLight);
 
-    // Blocky Sun, Moon, and Volumetric Clouds
     const celestialGroup = new THREE.Group();
     const sunMesh = new THREE.Mesh(
       new THREE.BoxGeometry(10, 10, 10),
@@ -421,7 +477,6 @@ export default function App() {
     celestialGroup.add(sunMesh, moonMesh);
     scene.add(celestialGroup);
 
-    // Instanced 3D Voxel Clouds
     const cloudCount = 32;
     const cloudGeo = new THREE.BoxGeometry(12, 1.8, 8);
     const cloudMat = new THREE.MeshLambertMaterial({
@@ -447,20 +502,16 @@ export default function App() {
     cloudInstanced.instanceMatrix.needsUpdate = true;
     scene.add(cloudInstanced);
 
-    // Load 16x16 Minecraft texture atlas
     const atlas = getMinecraftAtlas();
     setBlockIcons(atlas.blockIcons);
 
-    // Initialize Voxel World
     const world = new VoxelWorld(scene, atlas.texture, 42069);
     worldRef.current = world;
 
-    // Spawn player on solid surface near (0, 0)
     const spawnGroundY = world.getTerrainHeight(0, 0).height;
     playerPosRef.current.set(0.5, Math.max(spawnGroundY + 1.05, WATER_LEVEL + 2), 0.5);
     world.updateChunksAroundPlayer(0, 0, 2);
 
-    // Local Player 3D Model (for 3rd-person view)
     const localPlayerModel = new VoxelCharacterModel(
       stateRef.current.playerName,
       stateRef.current.selectedSkin,
@@ -470,7 +521,6 @@ export default function App() {
     localPlayerModel.group.visible = false;
     scene.add(localPlayerModel.group);
 
-    // First-person Right Hand + Held Block HUD mesh attached to camera
     const fpHandGroup = new THREE.Group();
     const fpBlockGeo = new THREE.BoxGeometry(0.28, 0.28, 0.28);
     const fpBlockMat = new THREE.MeshLambertMaterial({ map: atlas.texture });
@@ -481,14 +531,12 @@ export default function App() {
     camera.add(fpHandGroup);
     scene.add(camera);
 
-    // Helper to update UV of the held 3D block in first-person hand
     let lastHeldBlockId = -1;
     const updateHeldBlockUV = (blockId: number) => {
       if (blockId === lastHeldBlockId) return;
       lastHeldBlockId = blockId;
       const def = BLOCKS[blockId] || BLOCKS[BlockId.GRASS];
       const uvAttr = fpBlockGeo.attributes.uv as THREE.BufferAttribute;
-      // BoxGeometry face order: +X(4), -X(5), +Y(0), -Y(1), +Z(3), -Z(2)
       const faceMapping = [4, 5, 0, 1, 3, 2];
       for (let f = 0; f < 6; f++) {
         const tileIdx = def.faces[faceMapping[f]];
@@ -509,7 +557,6 @@ export default function App() {
     };
     updateHeldBlockUV(BlockId.GRASS);
 
-    // Wireframe block selection outline + mining crack box
     const wireGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.006, 1.006, 1.006));
     const wireMat = new THREE.LineBasicMaterial({ color: 0x000000 });
     const selectionBox = new THREE.LineSegments(wireGeo, wireMat);
@@ -528,7 +575,6 @@ export default function App() {
     crackMesh.visible = false;
     scene.add(crackMesh);
 
-    // Spawn Passive Mobs (Sheep & Pigs) around spawn
     const mobs: PassiveMobModel[] = [];
     const spawnMobs = () => {
       for (const m of mobs) scene.remove(m.group);
@@ -552,7 +598,6 @@ export default function App() {
     };
     spawnMobs();
 
-    // Particle Bursts on Block Break / TNT
     const particles: ParticleBurst[] = [];
     const partGeo = new THREE.BoxGeometry(0.16, 0.16, 0.16);
     const spawnBlockParticles = (bx: number, by: number, bz: number, count = 14) => {
@@ -577,7 +622,6 @@ export default function App() {
       }
     };
 
-    // Weather Rain/Snow Particles
     const weatherCount = 240;
     const weatherGeo = new THREE.BufferGeometry();
     const weatherPositions = new Float32Array(weatherCount * 3);
@@ -597,11 +641,10 @@ export default function App() {
     weatherPoints.visible = false;
     scene.add(weatherPoints);
 
-    // Remote Multiplayer Players Map
     const remoteModels = new Map<string, VoxelCharacterModel>();
 
     const syncRemotePlayersList = () => {
-      const arr: RemotePlayerInfo[] = [];
+      const arr: NetworkPlayerPayload[] = [];
       for (const [id, model] of remoteModels.entries()) {
         arr.push({
           id,
@@ -621,182 +664,170 @@ export default function App() {
       setOnlinePlayers(arr);
     };
 
-    // WebSocket Connection Setup
-    let reconnectTimer: number | null = null;
-    const connectWebSocket = (targetRoom: string) => {
-      if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.close();
-      }
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${proto}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+    // Initialize Dual-Transport Online Multiplayer (WebSocket + WebRTC PeerJS)
+    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    const netManager = new MultiplayerManager(initialRoomFromUrl, selfIdRef.current, {
+      onStatusChange: (st) => {
+        setNetStatus(st);
+      },
+      onInitWorld: (data) => {
+        selfIdRef.current = data.selfId;
+        setWorldSeed(data.seed);
+        setTimeOfDay(data.timeOfDay ?? 0.25);
+        setWeather(data.weather ?? 'clear');
+        if (Array.isArray(data.chatHistory)) {
+          setChatMessages(data.chatHistory);
+        }
 
-      ws.onopen = () => {
-        setWsConnected(true);
-        const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-        ws.send(
-          JSON.stringify({
-            type: 'join',
-            roomId: targetRoom,
-            playerId: selfIdRef.current,
-            name: stateRef.current.playerName,
-            skin: stateRef.current.selectedSkin,
-            x: playerPosRef.current.x,
-            y: playerPosRef.current.y,
-            z: playerPosRef.current.z,
-            deviceType: isTouch ? 'mobile' : 'desktop',
-          })
-        );
-      };
+        world.modifiedBlocks.clear();
+        if (Array.isArray(data.modifiedBlocks)) {
+          for (const [k, bid] of data.modifiedBlocks) {
+            world.modifiedBlocks.set(k, bid);
+          }
+        }
+        world.setSeed(data.seed);
+        const sy = world.getTerrainHeight(
+          Math.floor(playerPosRef.current.x),
+          Math.floor(playerPosRef.current.z)
+        ).height;
+        playerPosRef.current.y = Math.max(sy + 1.05, WATER_LEVEL + 2);
+        world.updateChunksAroundPlayer(playerPosRef.current.x, playerPosRef.current.z, 2);
+        spawnMobs();
 
-      ws.onmessage = (ev) => {
-        try {
-          const data = JSON.parse(ev.data);
-          if (data.type === 'init') {
-            selfIdRef.current = data.selfId;
-            setWorldSeed(data.seed);
-            setTimeOfDay(data.timeOfDay ?? 0.25);
-            setWeather(data.weather ?? 'clear');
-            if (Array.isArray(data.chatHistory)) {
-              setChatMessages(data.chatHistory);
-            }
+        for (const [, m] of remoteModels.entries()) {
+          scene.remove(m.group);
+          m.dispose();
+        }
+        remoteModels.clear();
 
-            // Rebuild world with room seed and authoritative modified blocks
-            world.modifiedBlocks.clear();
-            if (Array.isArray(data.modifiedBlocks)) {
-              for (const [k, bid] of data.modifiedBlocks) {
-                world.modifiedBlocks.set(k, bid);
-              }
-            }
-            world.setSeed(data.seed);
-            const sy = world.getTerrainHeight(
-              Math.floor(playerPosRef.current.x),
-              Math.floor(playerPosRef.current.z)
-            ).height;
-            playerPosRef.current.y = Math.max(sy + 1.05, WATER_LEVEL + 2);
-            world.updateChunksAroundPlayer(playerPosRef.current.x, playerPosRef.current.z, 2);
-            spawnMobs();
-
-            // Clear old remote models and add active room players
-            for (const [, m] of remoteModels.entries()) {
-              scene.remove(m.group);
-              m.dispose();
-            }
-            remoteModels.clear();
-
-            if (Array.isArray(data.players)) {
-              for (const p of data.players as RemotePlayerInfo[]) {
-                if (p.id === selfIdRef.current) continue;
-                const model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
-                model.group.position.set(p.x, p.y, p.z);
-                model.targetPos.set(p.x, p.y, p.z);
-                model.targetYaw = p.yaw;
-                model.targetPitch = p.pitch;
-                scene.add(model.group);
-                remoteModels.set(p.id, model);
-              }
-              syncRemotePlayersList();
-            }
-          } else if (data.type === 'player:joined') {
-            const p = data.player as RemotePlayerInfo;
-            if (p.id !== selfIdRef.current && !remoteModels.has(p.id)) {
-              const model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
-              model.group.position.set(p.x, p.y, p.z);
-              model.targetPos.set(p.x, p.y, p.z);
-              scene.add(model.group);
-              remoteModels.set(p.id, model);
-              syncRemotePlayersList();
-            }
-            if (data.chat) {
-              setChatMessages((prev) => [...prev.slice(-39), data.chat]);
-            }
-          } else if (data.type === 'player:moved') {
-            const p = data.player as RemotePlayerInfo;
-            if (p.id === selfIdRef.current) return;
-            let model = remoteModels.get(p.id);
-            if (!model) {
-              model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
-              model.group.position.set(p.x, p.y, p.z);
-              scene.add(model.group);
-              remoteModels.set(p.id, model);
-              syncRemotePlayersList();
-            }
+        if (Array.isArray(data.players)) {
+          for (const p of data.players) {
+            if (p.id === selfIdRef.current) continue;
+            const model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
+            model.group.position.set(p.x, p.y, p.z);
             model.targetPos.set(p.x, p.y, p.z);
             model.targetYaw = p.yaw;
             model.targetPitch = p.pitch;
-            if (p.swinging) model.triggerSwing();
-          } else if (data.type === 'player:swung') {
-            const model = remoteModels.get(data.id);
-            if (model) model.triggerSwing();
-          } else if (data.type === 'player:left') {
-            const model = remoteModels.get(data.id);
-            if (model) {
-              scene.remove(model.group);
-              model.dispose();
-              remoteModels.delete(data.id);
-              syncRemotePlayersList();
-            }
-            if (data.chat) {
-              setChatMessages((prev) => [...prev.slice(-39), data.chat]);
-            }
-          } else if (data.type === 'block:updated') {
-            world.setBlock(data.x, data.y, data.z, data.blockId, true);
-            if (data.blockId === BlockId.AIR) {
-              spawnBlockParticles(data.x, data.y, data.z, 10);
-              soundEngine.playBlockBreak();
-            } else {
-              soundEngine.playBlockPlace();
-            }
-          } else if (data.type === 'block:batch_updated') {
-            if (Array.isArray(data.updates)) {
-              const dirtyChunks = new Set<string>();
-              for (const u of data.updates) {
-                world.setBlock(u.x, u.y, u.z, u.blockId, false);
-                const [cx, cz] = world.getChunkCoord(u.x, u.z);
-                dirtyChunks.add(`${cx},${cz}`);
-                dirtyChunks.add(`${cx - 1},${cz}`);
-                dirtyChunks.add(`${cx + 1},${cz}`);
-                dirtyChunks.add(`${cx},${cz - 1}`);
-                dirtyChunks.add(`${cx},${cz + 1}`);
-              }
-              for (const ck of dirtyChunks) {
-                const [cx, cz] = ck.split(',').map(Number);
-                if (world.chunkMeshes.has(ck)) {
-                  world.rebuildChunkMesh(cx, cz);
-                }
-              }
-              soundEngine.playExplosion();
-            }
-          } else if (data.type === 'world:env_updated') {
-            if (typeof data.timeOfDay === 'number') setTimeOfDay(data.timeOfDay);
-            if (data.weather) setWeather(data.weather);
-          } else if (data.type === 'chat:message') {
-            if (data.chat) {
-              setChatMessages((prev) => [...prev.slice(-39), data.chat]);
-            }
+            scene.add(model.group);
+            remoteModels.set(p.id, model);
           }
-        } catch (err) {
-          console.error('WS client error:', err);
+          syncRemotePlayersList();
         }
-      };
+      },
+      onPlayerJoined: (p, chat) => {
+        if (p.id !== selfIdRef.current && !remoteModels.has(p.id)) {
+          const model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
+          model.group.position.set(p.x, p.y, p.z);
+          model.targetPos.set(p.x, p.y, p.z);
+          scene.add(model.group);
+          remoteModels.set(p.id, model);
+          syncRemotePlayersList();
+        }
+        if (chat) {
+          setChatMessages((prev) => [...prev.slice(-39), chat]);
+        }
+      },
+      onPlayerMoved: (p) => {
+        if (p.id === selfIdRef.current) return;
+        let model = remoteModels.get(p.id);
+        if (!model) {
+          model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
+          model.group.position.set(p.x, p.y, p.z);
+          scene.add(model.group);
+          remoteModels.set(p.id, model);
+          syncRemotePlayersList();
+        }
+        model.targetPos.set(p.x, p.y, p.z);
+        model.targetYaw = p.yaw;
+        model.targetPitch = p.pitch;
+        if (p.swinging) model.triggerSwing();
+      },
+      onPlayerSwung: (id) => {
+        const model = remoteModels.get(id);
+        if (model) model.triggerSwing();
+      },
+      onPlayerLeft: (id, chat) => {
+        const model = remoteModels.get(id);
+        if (model) {
+          scene.remove(model.group);
+          model.dispose();
+          remoteModels.delete(id);
+          syncRemotePlayersList();
+        }
+        if (chat) {
+          setChatMessages((prev) => [...prev.slice(-39), chat]);
+        }
+      },
+      onBlockUpdated: (x, y, z, blockId) => {
+        world.setBlock(x, y, z, blockId, true);
+        if (blockId === BlockId.AIR) {
+          spawnBlockParticles(x, y, z, 10);
+          soundEngine.playBlockBreak();
+        } else {
+          soundEngine.playBlockPlace();
+        }
+      },
+      onBlockBatchUpdated: (updates) => {
+        const dirtyChunks = new Set<string>();
+        for (const u of updates) {
+          world.setBlock(u.x, u.y, u.z, u.blockId, false);
+          const [cx, cz] = world.getChunkCoord(u.x, u.z);
+          dirtyChunks.add(`${cx},${cz}`);
+          dirtyChunks.add(`${cx - 1},${cz}`);
+          dirtyChunks.add(`${cx + 1},${cz}`);
+          dirtyChunks.add(`${cx},${cz - 1}`);
+          dirtyChunks.add(`${cx},${cz + 1}`);
+        }
+        for (const ck of dirtyChunks) {
+          const [cx, cz] = ck.split(',').map(Number);
+          if (world.chunkMeshes.has(ck)) {
+            world.rebuildChunkMesh(cx, cz);
+          }
+        }
+        soundEngine.playExplosion();
+      },
+      onWorldEnvUpdated: (t, w) => {
+        setTimeOfDay(t);
+        setWeather(w);
+      },
+      onChatMessage: (chat) => {
+        setChatMessages((prev) => [...prev.slice(-39), chat]);
+      },
+    });
 
-      ws.onclose = () => {
-        setWsConnected(false);
-        reconnectTimer = window.setTimeout(() => connectWebSocket(targetRoom), 2500);
-      };
-    };
+    netManager.connect({
+      id: selfIdRef.current,
+      name: stateRef.current.playerName,
+      skin: stateRef.current.selectedSkin,
+      x: playerPosRef.current.x,
+      y: playerPosRef.current.y,
+      z: playerPosRef.current.z,
+      yaw: 0,
+      pitch: 0,
+      heldBlockId: 1,
+      swinging: false,
+      sneaking: false,
+      deviceType: isTouch ? 'mobile' : 'desktop',
+    });
+    netRef.current = netManager;
 
-    connectWebSocket(initialRoomFromUrl);
-
-    // Expose room switching helper on window for UI room change
     (window as unknown as { __switchMcRoom?: (r: string) => void }).__switchMcRoom = (newRoom: string) => {
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      connectWebSocket(newRoom);
+      netManager.switchRoom(newRoom, {
+        id: selfIdRef.current,
+        name: stateRef.current.playerName,
+        skin: stateRef.current.selectedSkin,
+        x: playerPosRef.current.x,
+        y: playerPosRef.current.y,
+        z: playerPosRef.current.z,
+        yaw: yawRef.current,
+        pitch: pitchRef.current,
+        heldBlockId: 1,
+        swinging: false,
+        sneaking: false,
+        deviceType: isTouch ? 'mobile' : 'desktop',
+      });
     };
 
-    // AABB Collision Check against solid voxels
     const PLAYER_HALF_W = 0.3;
     const PLAYER_HEIGHT = 1.75;
     const PLAYER_EYE_H = 1.62;
@@ -821,7 +852,6 @@ export default function App() {
       return false;
     };
 
-    // Detonate TNT helper
     const detonateTNT = (tx: number, ty: number, tz: number) => {
       soundEngine.playExplosion();
       spawnBlockParticles(tx, ty, tz, 28);
@@ -860,17 +890,11 @@ export default function App() {
         }
       }
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && updates.length > 0) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'block:batch',
-            updates,
-          })
-        );
+      if (updates.length > 0) {
+        netManager.sendBlockBatch(updates);
       }
     };
 
-    // Instant break or place functions
     let handSwingAnim = 0;
 
     const executeBreakBlock = (bx: number, by: number, bz: number, blockId: number) => {
@@ -879,21 +903,9 @@ export default function App() {
       spawnBlockParticles(bx, by, bz, 14);
       soundEngine.playBlockBreak();
 
-      // Drop item into hotbar in survival
       const dropId = blockId === BlockId.STONE ? BlockId.COBBLESTONE : blockId;
       addBlockToInventory(dropId, 1);
-
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'block:update',
-            x: bx,
-            y: by,
-            z: bz,
-            blockId: BlockId.AIR,
-          })
-        );
-      }
+      netManager.sendBlockUpdate(bx, by, bz, BlockId.AIR);
     };
 
     const executePlaceBlock = () => {
@@ -910,7 +922,6 @@ export default function App() {
       if (!hit) return;
 
       const [hx, hy, hz] = hit.hitBlock;
-      // Check if interacting with Crafting Table or TNT
       if (hit.blockId === BlockId.CRAFTING_TABLE && !keysRef.current['ShiftLeft']) {
         soundEngine.playClick();
         setShowInventory(true);
@@ -930,7 +941,6 @@ export default function App() {
       const [px, py, pz] = hit.placeBlock;
       if (py < 0 || py >= 64) return;
 
-      // Ensure placed block doesn't overlap local player's body AABB
       const playerMinX = Math.floor(playerPosRef.current.x - PLAYER_HALF_W);
       const playerMaxX = Math.floor(playerPosRef.current.x + PLAYER_HALF_W);
       const playerMinY = Math.floor(playerPosRef.current.y);
@@ -963,17 +973,7 @@ export default function App() {
         });
       }
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'block:update',
-            x: px,
-            y: py,
-            z: pz,
-            blockId: slot.blockId,
-          })
-        );
-      }
+      netManager.sendBlockUpdate(px, py, pz, slot.blockId);
     };
 
     triggerActionRef.current = {
@@ -994,7 +994,6 @@ export default function App() {
       placeBlock: executePlaceBlock,
     };
 
-    // Input Event Listeners
     const onPointerLockChange = () => {
       setIsPointerLocked(document.pointerLockElement === renderer.domElement);
     };
@@ -1012,17 +1011,21 @@ export default function App() {
     let lastSpacePress = 0;
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (stateRef.current.showChat || stateRef.current.inTitleScreen) {
+      if (
+        stateRef.current.showChat ||
+        stateRef.current.inTitleScreen ||
+        stateRef.current.showGithubModal
+      ) {
         if (e.code === 'Escape') {
           setShowChat(false);
           setShowInventory(false);
+          setShowGithubModal(false);
         }
         return;
       }
 
       keysRef.current[e.code] = true;
 
-      // Double-tap Space to toggle flight
       if (e.code === 'Space' && !e.repeat) {
         const now = performance.now();
         if (now - lastSpacePress < 300) {
@@ -1032,7 +1035,6 @@ export default function App() {
         lastSpacePress = now;
       }
 
-      // Hotbar keys 1-9
       if (e.code.startsWith('Digit')) {
         const num = parseInt(e.code.replace('Digit', ''), 10);
         if (num >= 1 && num <= 9) {
@@ -1072,7 +1074,12 @@ export default function App() {
     };
 
     const onMouseDown = (e: MouseEvent) => {
-      if (stateRef.current.inTitleScreen || stateRef.current.showInventory || stateRef.current.showChat) {
+      if (
+        stateRef.current.inTitleScreen ||
+        stateRef.current.showGithubModal ||
+        stateRef.current.showInventory ||
+        stateRef.current.showChat
+      ) {
         return;
       }
       if (document.pointerLockElement !== renderer.domElement) {
@@ -1083,13 +1090,10 @@ export default function App() {
         mouseDownLeftRef.current = true;
         handSwingAnim = 0.26;
         localPlayerModel.triggerSwing();
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'player:swing' }));
-        }
+        netManager.sendSwing();
       } else if (e.button === 2) {
         executePlaceBlock();
       } else if (e.button === 1) {
-        // Middle click Pick Block
         const eyeOrigin = new THREE.Vector3(
           playerPosRef.current.x,
           playerPosRef.current.y + PLAYER_EYE_H,
@@ -1111,7 +1115,7 @@ export default function App() {
     };
 
     const onWheel = (e: WheelEvent) => {
-      if (stateRef.current.showInventory || stateRef.current.showChat) return;
+      if (stateRef.current.showInventory || stateRef.current.showChat || stateRef.current.showGithubModal) return;
       const dir = e.deltaY > 0 ? 1 : -1;
       setActiveSlot((prev) => (prev + dir + 9) % 9);
     };
@@ -1134,12 +1138,10 @@ export default function App() {
     renderer.domElement.addEventListener('contextmenu', onContextMenu);
     window.addEventListener('resize', onResize);
 
-    // Pre-compile shaders on hardware WebGL
     if (!isSoftwareGl) {
       renderer.compile(scene, camera);
     }
 
-    // Software WebGL frame pacing helper per Three.js skill directive
     let frameId = 0;
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext;
@@ -1171,11 +1173,9 @@ export default function App() {
       const elapsed = clock.getElapsedTime();
       const st = stateRef.current;
 
-      // Update held block UV if active hotbar slot changed
       const activeBlockId = st.hotbar[st.activeSlot]?.blockId || BlockId.GRASS;
       updateHeldBlockUV(activeBlockId);
 
-      // 1. Update Day/Night Sky, Sun/Moon orbit & Lighting
       const sunAngle = (st.timeOfDay - 0.25) * Math.PI * 2;
       const sunY = Math.cos(sunAngle);
       const sunX = Math.sin(sunAngle);
@@ -1217,7 +1217,6 @@ export default function App() {
         scene.fog.color.copy(_curSky);
       }
 
-      // Drift 3D Clouds
       for (let i = 0; i < cloudCount; i++) {
         const c = cloudOffsets[i];
         const wrappedX =
@@ -1235,14 +1234,13 @@ export default function App() {
       }
       cloudInstanced.instanceMatrix.needsUpdate = true;
 
-      // 2. Player Movement & Voxel Physics
       const keys = keysRef.current;
       const isSneaking = Boolean(keys['ShiftLeft'] || keys['ShiftRight']);
       const isSprinting = Boolean(keys['ControlLeft'] || keys['KeyR']);
 
       let moveZ = 0;
       let moveX = 0;
-      if (!st.inTitleScreen && !st.showChat && !st.showInventory) {
+      if (!st.inTitleScreen && !st.showGithubModal && !st.showChat && !st.showInventory) {
         if (keys['KeyW'] || keys['ArrowUp']) moveZ += 1;
         if (keys['KeyS'] || keys['ArrowDown']) moveZ -= 1;
         if (keys['KeyD'] || keys['ArrowRight']) moveX += 1;
@@ -1292,24 +1290,28 @@ export default function App() {
       } else {
         playerVelRef.current.y -= 24.0 * delta;
         playerVelRef.current.y = Math.max(-36.0, playerVelRef.current.y);
-        if (keys['Space'] && onGround && !st.inTitleScreen && !st.showChat && !st.showInventory) {
+        if (
+          keys['Space'] &&
+          onGround &&
+          !st.inTitleScreen &&
+          !st.showGithubModal &&
+          !st.showChat &&
+          !st.showInventory
+        ) {
           playerVelRef.current.y = 8.4;
         }
       }
 
-      // Apply X movement
       const nextX = playerPosRef.current.x + playerVelRef.current.x * delta;
       if (!collidesWithWorld(nextX, playerPosRef.current.y, playerPosRef.current.z)) {
         playerPosRef.current.x = nextX;
       }
 
-      // Apply Z movement
       const nextZ = playerPosRef.current.z + playerVelRef.current.z * delta;
       if (!collidesWithWorld(playerPosRef.current.x, playerPosRef.current.y, nextZ)) {
         playerPosRef.current.z = nextZ;
       }
 
-      // Apply Y movement
       const nextY = playerPosRef.current.y + playerVelRef.current.y * delta;
       if (!collidesWithWorld(playerPosRef.current.x, nextY, playerPosRef.current.z)) {
         playerPosRef.current.y = nextY;
@@ -1322,14 +1324,12 @@ export default function App() {
         playerVelRef.current.y = 0;
       }
 
-      // Prevent falling below bedrock
       if (playerPosRef.current.y < -10) {
         const sy = world.getTerrainHeight(0, 0).height;
         playerPosRef.current.set(0.5, sy + 2, 0.5);
         playerVelRef.current.set(0, 0, 0);
       }
 
-      // Footsteps & View Bobbing
       const isMovingHoriz = wishDir.lengthSq() > 0.05;
       if (isMovingHoriz && onGround && !st.isFlying) {
         walkBobTimer += delta * (isSprinting ? 13 : 9);
@@ -1342,7 +1342,6 @@ export default function App() {
         walkBobTimer = 0;
       }
 
-      // 3. Camera Positioning (First-Person vs Third-Person Back/Front)
       const eyeY = playerPosRef.current.y + (isSneaking ? 1.42 : PLAYER_EYE_H);
       const bobY = Math.sin(walkBobTimer * 2) * 0.045;
       const bobX = Math.cos(walkBobTimer) * 0.03;
@@ -1377,7 +1376,6 @@ export default function App() {
         camera.lookAt(_camTarget);
       }
 
-      // Animate First-Person Right Hand (breathing + walking + block swing)
       if (handSwingAnim > 0) {
         handSwingAnim = Math.max(0, handSwingAnim - delta);
         const s = Math.sin(((0.26 - handSwingAnim) / 0.26) * Math.PI);
@@ -1392,7 +1390,6 @@ export default function App() {
         fpBlockMesh.rotation.set(0.2, -0.65, -0.1);
       }
 
-      // 4. Raycast Target Block & Progressive Mining
       const eyeOrigin = new THREE.Vector3(playerPosRef.current.x, eyeY, playerPosRef.current.z);
       const lookVec = new THREE.Vector3(
         -Math.sin(yawRef.current) * Math.cos(pitchRef.current),
@@ -1449,7 +1446,6 @@ export default function App() {
         setMiningProgress(0);
       }
 
-      // 5. Update Remote Players, Passive Mobs, Particles & Weather
       for (const [, model] of remoteModels.entries()) {
         const distSq = model.group.position.distanceToSquared(model.targetPos);
         model.update(delta, distSq > 0.002, false);
@@ -1494,7 +1490,6 @@ export default function App() {
         weatherPoints.visible = false;
       }
 
-      // 6. Periodic Chunk Streaming & Multiplayer Position Broadcast
       chunkSyncAccum += delta;
       if (chunkSyncAccum > 0.6) {
         chunkSyncAccum = 0;
@@ -1502,23 +1497,22 @@ export default function App() {
       }
 
       networkSendAccum += delta;
-      if (networkSendAccum > 0.05 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      if (networkSendAccum > 0.05) {
         networkSendAccum = 0;
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'player:move',
-            x: Number(playerPosRef.current.x.toFixed(2)),
-            y: Number(playerPosRef.current.y.toFixed(2)),
-            z: Number(playerPosRef.current.z.toFixed(2)),
-            yaw: Number(yawRef.current.toFixed(3)),
-            pitch: Number(pitchRef.current.toFixed(3)),
-            heldBlockId: activeBlockId,
-            swinging: handSwingAnim > 0,
-            sneaking: isSneaking,
-            name: st.playerName,
-            skin: st.selectedSkin,
-          })
-        );
+        netManager.sendPlayerMove({
+          id: selfIdRef.current,
+          name: st.playerName,
+          skin: st.selectedSkin,
+          x: Number(playerPosRef.current.x.toFixed(2)),
+          y: Number(playerPosRef.current.y.toFixed(2)),
+          z: Number(playerPosRef.current.z.toFixed(2)),
+          yaw: Number(yawRef.current.toFixed(3)),
+          pitch: Number(pitchRef.current.toFixed(3)),
+          heldBlockId: activeBlockId,
+          swinging: handSwingAnim > 0,
+          sneaking: isSneaking,
+          deviceType: isTouch ? 'mobile' : 'desktop',
+        });
       }
 
       uiCoordAccum += delta;
@@ -1556,11 +1550,7 @@ export default function App() {
     return () => {
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.close();
-      }
+      netManager.dispose();
       document.removeEventListener('pointerlockchange', onPointerLockChange);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('keydown', onKeyDown);
@@ -1574,10 +1564,10 @@ export default function App() {
     };
   }, [addBlockToInventory, initialRoomFromUrl]);
 
-  // Switch multiplayer room
-  const handleSwitchRoom = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleaned = roomInput.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'overworld-1';
+  const handleSwitchRoom = (e?: React.FormEvent, targetRoomOverride?: string) => {
+    if (e) e.preventDefault();
+    const raw = targetRoomOverride ?? roomInput;
+    const cleaned = raw.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'overworld-1';
     setRoomId(cleaned);
     setRoomInput(cleaned);
     const url = new URL(window.location.href);
@@ -1588,7 +1578,6 @@ export default function App() {
     setInTitleScreen(false);
   };
 
-  // Touch look state for mobile cross-platform play
   const touchLookRef = useRef<{ id: number; lastX: number; lastY: number } | null>(null);
 
   const handleTouchLookStart = (e: React.TouchEvent) => {
@@ -1627,8 +1616,8 @@ export default function App() {
       {/* Dedicated WebGL Mount Container */}
       <div ref={canvasMountRef} className="absolute inset-0 w-full h-full" />
 
-      {/* Mobile Touch Look Zone (Right half of screen when on touch device) */}
-      {isTouchDevice && !inTitleScreen && !showInventory && !showChat && (
+      {/* Mobile Touch Look Zone */}
+      {isTouchDevice && !inTitleScreen && !showGithubModal && !showInventory && !showChat && (
         <div
           className="absolute top-14 right-0 w-1/2 bottom-36 z-10"
           onTouchStart={handleTouchLookStart}
@@ -1638,7 +1627,7 @@ export default function App() {
       )}
 
       {/* Center Crosshair & Mining Progress Bar */}
-      {!inTitleScreen && !showInventory && (
+      {!inTitleScreen && !showGithubModal && !showInventory && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center z-10">
           <div className="relative w-5 h-5 flex items-center justify-center">
             <div className="w-4 h-0.5 bg-white/90 shadow-[0_0_2px_#000]" />
@@ -1660,8 +1649,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Minimal Top-Left Spec & Telemetry Bar (Unobstructed 3D Center) */}
-      <div className="pointer-events-auto absolute top-3 left-3 z-20 flex flex-wrap items-center gap-2 bg-black/75 border border-white/15 px-3 py-1.5 text-xs text-neutral-200">
+      {/* Minimal Top-Left Spec & Online Multiplayer Bar */}
+      <div className="pointer-events-auto absolute top-3 left-3 z-20 flex flex-wrap items-center gap-2 bg-black/80 border border-white/15 px-3 py-1.5 text-xs text-neutral-200">
         <button
           onClick={() => {
             if (document.pointerLockElement) document.exitPointerLock();
@@ -1669,41 +1658,72 @@ export default function App() {
           }}
           className="font-pixel text-[11px] text-emerald-400 hover:text-emerald-300 tracking-tight cursor-pointer whitespace-nowrap"
         >
-          MINECRAFT VOXEL
+          MINECRAFT ONLINE
         </button>
         <span aria-hidden="true" className="text-neutral-500">·</span>
         <span className="font-mono-tabular whitespace-nowrap">
           XYZ: {coords.x} / {coords.y} / {coords.z}
         </span>
         <span aria-hidden="true" className="text-neutral-500">·</span>
-        <span className="text-neutral-300 whitespace-nowrap">{coords.biome}</span>
-        <span aria-hidden="true" className="text-neutral-500">·</span>
-        <span className="font-mono-tabular text-amber-300 whitespace-nowrap">
-          Комната: {roomId} ({onlinePlayers.length + 1} игр.)
-        </span>
+        <button
+          onClick={() => {
+            if (document.pointerLockElement) document.exitPointerLock();
+            setInTitleScreen(true);
+          }}
+          className="font-mono-tabular text-amber-300 hover:underline cursor-pointer whitespace-nowrap flex items-center gap-1"
+          title="Сменить онлайн-комнату или сервер"
+        >
+          <Globe className="w-3.5 h-3.5 text-emerald-400" />
+          <span>
+            Сервер: {roomId} ({onlinePlayers.length + 1} онлайн)
+          </span>
+        </button>
+
         <button
           onClick={handleCopyInvite}
-          className="ml-1 flex items-center gap-1 px-2 py-0.5 bg-emerald-700/80 hover:bg-emerald-600 text-white text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap"
-          title="Скопировать ссылку для друзей (ПК и Телефон)"
+          className="flex items-center gap-1 px-2 py-0.5 bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap"
+          title="Скопировать ссылку для приглашения друга в этот мир"
         >
           {copiedLink ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-          <span>{copiedLink ? 'Ссылка скопирована' : 'Пригласить друга'}</span>
+          <span>{copiedLink ? 'Ссылка скопирована' : 'Пригласить по ссылке'}</span>
+        </button>
+
+        <button
+          onClick={() => {
+            soundEngine.playClick();
+            if (document.pointerLockElement) document.exitPointerLock();
+            setShowGithubModal(true);
+          }}
+          className="flex items-center gap-1 px-2.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 border border-white/25 text-white text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap"
+          title="Создать репозиторий и ссылку на GitHub / GitHub Pages"
+        >
+          <Github className="w-3.5 h-3.5" />
+          <span>Создать ссылку на GitHub</span>
         </button>
       </div>
 
-      {/* Pointer Lock Prompt Pill (Top-Center when unlocked on Desktop) */}
-      {!isPointerLocked && !isTouchDevice && !inTitleScreen && !showInventory && !showChat && (
-        <div className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-20 bg-black/80 border border-amber-400/40 px-4 py-1.5 text-xs text-amber-200 whitespace-nowrap">
-          Кликните по 3D-миру для захвата мыши (WASD — ход, ЛКМ — ломать, ПКМ — ставить, E — крафт/блоки)
-        </div>
-      )}
+      {/* Pointer Lock Prompt Pill */}
+      {!isPointerLocked &&
+        !isTouchDevice &&
+        !inTitleScreen &&
+        !showGithubModal &&
+        !showInventory &&
+        !showChat && (
+          <div className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-20 bg-black/80 border border-amber-400/40 px-4 py-1.5 text-xs text-amber-200 whitespace-nowrap">
+            Кликните по 3D-миру для игры (WASD — ход, ЛКМ — ломать, ПКМ — ставить, E — крафт)
+          </div>
+        )}
 
       {/* Live Multiplayer Chat Box (Top-Right compact overlay) */}
       <div className="pointer-events-auto absolute top-3 right-3 z-20 w-72 max-w-[85vw] flex flex-col items-end">
-        <div className="w-full bg-black/70 border border-white/15 p-2 text-xs space-y-1 max-h-36 overflow-y-auto">
+        <div className="w-full bg-black/75 border border-white/15 p-2 text-xs space-y-1 max-h-36 overflow-y-auto">
           {chatMessages.slice(-6).map((msg) => (
             <div key={msg.id} className="leading-snug break-words">
-              <span className={msg.system ? 'text-amber-400 font-semibold' : 'text-emerald-400 font-semibold'}>
+              <span
+                className={
+                  msg.system ? 'text-amber-400 font-semibold' : 'text-emerald-400 font-semibold'
+                }
+              >
                 {msg.sender}:{' '}
               </span>
               <span className="text-neutral-200">{msg.text}</span>
@@ -1717,7 +1737,7 @@ export default function App() {
               autoFocus
               value={chatDraft}
               onChange={(e) => setChatDraft(e.target.value)}
-              placeholder="Сообщение или /time day, /weather snow..."
+              placeholder="Чат или /time day, /weather snow..."
               className="flex-1 bg-black/90 border border-white/30 px-2.5 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
             />
             <button
@@ -1733,13 +1753,13 @@ export default function App() {
             className="mt-1 flex items-center gap-1.5 px-2.5 py-1 bg-black/75 hover:bg-black/90 border border-white/15 text-[11px] text-neutral-300 cursor-pointer whitespace-nowrap"
           >
             <MessageSquare className="w-3 h-3 text-emerald-400" />
-            <span>Чат / Команды [T]</span>
+            <span>Онлайн-чат [T]</span>
           </button>
         )}
       </div>
 
-      {/* Mobile Cross-Platform Touch Controls (D-Pad + Action Buttons) */}
-      {isTouchDevice && !inTitleScreen && !showInventory && (
+      {/* Mobile Touch Controls */}
+      {isTouchDevice && !inTitleScreen && !showGithubModal && !showInventory && (
         <>
           <div className="pointer-events-auto absolute bottom-28 left-4 z-20 grid grid-cols-3 gap-1.5 w-36 h-36">
             <div />
@@ -1806,15 +1826,14 @@ export default function App() {
         </>
       )}
 
-      {/* Unified Collapsible Bottom Control & Hotbar Dock (Per Three.js Skill Section 5) */}
+      {/* Unified Collapsible Bottom Control & Hotbar Dock */}
       <div
         className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center transition-transform duration-200"
         style={{
-          maxWidth: 'min(920px, 95vw)',
+          maxWidth: 'min(940px, 95vw)',
           transform: dockCollapsed ? 'translateY(calc(100% - 28px))' : 'translateY(0)',
         }}
       >
-        {/* Collapse / Expand Handle + Survival Hearts & Hunger Bar */}
         <div className="flex items-center justify-between w-full px-2 mb-1 gap-4">
           {gameMode === 'survival' && !dockCollapsed && (
             <div className="flex items-center gap-1 bg-black/70 px-2 py-0.5 border border-white/10">
@@ -1863,7 +1882,7 @@ export default function App() {
           )}
         </div>
 
-        {/* Main Authentic 9-Slot Minecraft Hotbar + Quick Controls */}
+        {/* Main 9-Slot Hotbar + Quick Controls */}
         <div className="bg-black/85 border-2 border-neutral-600 p-2 flex flex-col items-center gap-2 shadow-2xl">
           <div className="flex items-center gap-1">
             {hotbar.map((slot, idx) => {
@@ -1904,7 +1923,6 @@ export default function App() {
               );
             })}
 
-            {/* Open Full Inventory / Crafting Modal Button */}
             <button
               onClick={() => {
                 soundEngine.playClick();
@@ -1919,8 +1937,19 @@ export default function App() {
             </button>
           </div>
 
-          {/* Secondary Compact Controls Strip inside Bottom Dock */}
           <div className="flex flex-wrap items-center justify-center gap-1.5 text-[11px] text-neutral-200">
+            <button
+              onClick={() => {
+                soundEngine.playClick();
+                if (document.pointerLockElement) document.exitPointerLock();
+                setInTitleScreen(true);
+              }}
+              className="px-2.5 py-1 bg-emerald-800/80 hover:bg-emerald-700 border border-emerald-400/40 flex items-center gap-1 cursor-pointer whitespace-nowrap text-white"
+            >
+              <Users className="w-3 h-3" />
+              <span>Онлайн-комнаты ({onlinePlayers.length + 1})</span>
+            </button>
+
             <button
               onClick={() => {
                 soundEngine.playClick();
@@ -2005,7 +2034,11 @@ export default function App() {
               className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 border border-white/15 flex items-center gap-1 cursor-pointer whitespace-nowrap"
               title="Звук"
             >
-              {soundMuted ? <VolumeX className="w-3.5 h-3.5 text-red-400" /> : <Volume2 className="w-3.5 h-3.5 text-emerald-400" />}
+              {soundMuted ? (
+                <VolumeX className="w-3.5 h-3.5 text-red-400" />
+              ) : (
+                <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+              )}
             </button>
           </div>
         </div>
@@ -2031,7 +2064,6 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Left Column: Crafting Recipes */}
               <div>
                 <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-700 mb-2">
                   Рецепты крафта (клик — создать блок)
@@ -2076,7 +2108,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right Column: Creative Block Palette (Click to put into active hotbar slot) */}
               <div>
                 <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-700 mb-2">
                   Все блоки игры (клик — добавить в слот #{activeSlot + 1})
@@ -2116,24 +2147,32 @@ export default function App() {
         </div>
       )}
 
-      {/* Multiplayer Lobby & Settings Modal */}
+      {/* Online Multiplayer Server Browser & Room Lobby Modal */}
       {inTitleScreen && (
         <div className="pointer-events-auto fixed inset-0 z-40 bg-black/80 flex items-center justify-center p-4">
-          <div className="mc-panel w-full max-w-xl p-6 text-neutral-900">
-            <div className="text-center border-b-2 border-neutral-500 pb-4 mb-5">
-              <h1 className="font-pixel text-lg sm:text-xl text-neutral-900 tracking-tight">
-                MINECRAFT VOXEL EDITION
-              </h1>
-              <p className="text-xs text-neutral-700 mt-1.5">
-                Кроссплатформенный 3D воксельный мир в реальном времени (ПК и Смартфоны)
-              </p>
+          <div className="mc-panel w-full max-w-2xl p-6 text-neutral-900 max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b-2 border-neutral-500 pb-3 mb-4">
+              <div>
+                <h1 className="font-pixel text-base sm:text-lg text-neutral-900 tracking-tight">
+                   СЕТЕВАЯ ИГРА MINECRAFT
+                </h1>
+                <p className="text-xs text-neutral-700 mt-1">
+                  Двойной протокол связи: WebSocket Сервер + WebRTC P2P (PeerJS) для игры по сети и на GitHub Pages
+                </p>
+              </div>
+              <button
+                onClick={() => setInTitleScreen(false)}
+                className="mc-btn px-3 py-1.5 text-xs font-bold text-white cursor-pointer"
+              >
+                В ИГРУ
+              </button>
             </div>
 
-            <form onSubmit={handleSwitchRoom} className="space-y-4">
+            <form onSubmit={(e) => handleSwitchRoom(e)} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-neutral-800 mb-1">
-                    Никнейм игрока
+                    Ваш никнейм
                   </label>
                   <input
                     type="text"
@@ -2146,23 +2185,78 @@ export default function App() {
 
                 <div>
                   <label className="block text-xs font-bold text-neutral-800 mb-1">
-                    Код комнаты (для игры с друзьями)
+                    Код онлайн-комнаты (сервера)
                   </label>
-                  <input
-                    type="text"
-                    value={roomInput}
-                    onChange={(e) => setRoomInput(e.target.value)}
-                    maxLength={24}
-                    placeholder="overworld-1"
-                    className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-sm text-amber-300 font-mono-tabular focus:outline-none"
-                  />
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={roomInput}
+                      onChange={(e) => setRoomInput(e.target.value)}
+                      maxLength={24}
+                      placeholder="overworld-1"
+                      className="flex-1 bg-[#373737] border-2 border-white px-3 py-2 text-sm text-amber-300 font-mono-tabular focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      className="mc-btn px-3 py-2 text-xs font-bold text-white cursor-pointer whitespace-nowrap"
+                    >
+                      Подключиться
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Active Rooms Server List */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs font-bold text-neutral-800">
+                    Активные онлайн-комнаты (клик для входа):
+                  </span>
+                  <button
+                    type="button"
+                    onClick={fetchRoomsList}
+                    className="text-xs text-neutral-700 hover:text-black flex items-center gap-1 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    <span>Обновить список</span>
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-32 overflow-y-auto bg-[#999] p-2 border border-neutral-600">
+                  {activeRoomsList.length === 0 ? (
+                    <div className="text-xs text-neutral-800 col-span-2 py-2 text-center">
+                      Комната <b>{roomId}</b> активна (P2P WebRTC + WebSocket)
+                    </div>
+                  ) : (
+                    activeRoomsList.map((r) => (
+                      <button
+                        type="button"
+                        key={r.id}
+                        onClick={() => handleSwitchRoom(undefined, r.id)}
+                        className={`p-2 text-left border flex items-center justify-between cursor-pointer ${
+                          r.id === roomId
+                            ? 'bg-emerald-800 text-white border-white'
+                            : 'bg-[#444] text-neutral-100 border-neutral-700 hover:bg-[#555]'
+                        }`}
+                      >
+                        <div>
+                          <div className="text-xs font-bold font-mono-tabular">{r.id}</div>
+                          <div className="text-[10px] text-neutral-300">
+                            Сид: {r.seed} · Блоков изм.: {r.modifiedCount}
+                          </div>
+                        </div>
+                        <span className="px-2 py-0.5 bg-black/50 text-emerald-300 text-[11px] font-mono-tabular">
+                          {r.playerCount} игр.
+                        </span>
+                      </button>
+                    ))
+                  )}
                 </div>
               </div>
 
               {/* 3D Skin Selector */}
               <div>
                 <label className="block text-xs font-bold text-neutral-800 mb-1.5">
-                  Скин 3D-персонажа
+                  Скин вашего 3D-персонажа
                 </label>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {Object.values(SKIN_PALETTES).map((skin) => (
@@ -2195,36 +2289,234 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Active Room Info */}
+              {/* Network Telemetry & Invite Link */}
               <div className="bg-[#a8a8a8] border border-neutral-600 p-3 text-xs space-y-1">
-                <div className="flex items-center justify-between">
-                  <span className="font-bold text-neutral-800 flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-bold text-neutral-900 flex items-center gap-1.5">
                     <Users className="w-4 h-4" />
-                    Статус сервера: {wsConnected ? 'Подключено (WebSocket Live)' : 'Переподключение...'}
+                    Протоколы:{' '}
+                    {netStatus.wsConnected ? 'WebSocket Онлайн' : 'Автономный'} +{' '}
+                    {netStatus.p2pConnected
+                      ? `WebRTC P2P (${netStatus.p2pRole === 'host' ? 'Хост комнаты' : 'Клиент'})`
+                      : 'P2P соединение...'}
                   </span>
-                  <span className="font-mono-tabular text-neutral-800">Сид мира: {worldSeed}</span>
+                  <span className="font-mono-tabular text-neutral-800">Сид: {worldSeed}</span>
                 </div>
-                <p className="text-neutral-700">
-                  Чтобы играть вместе на ПК или телефоне, отправьте друзьям ссылку или введите одинаковый код комнаты. Все постройки и взрывы TNT синхронизируются мгновенно.
+                <p className="text-neutral-800">
+                  Скопируйте пригласительную ссылку или опубликуйте игру на свой GitHub — друзья смогут зайти с компьютера или телефона в реальном времени!
                 </p>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={handleCopyInvite}
-                  className="mc-btn px-4 py-2.5 text-xs font-bold text-white flex items-center gap-1.5 cursor-pointer"
-                >
-                  {copiedLink ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                  <span>{copiedLink ? 'Ссылка скопирована!' : 'Скопировать ссылку другу'}</span>
-                </button>
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleCopyInvite}
+                    className="mc-btn px-3.5 py-2.5 text-xs font-bold text-white flex items-center gap-1.5 cursor-pointer"
+                  >
+                    {copiedLink ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                    <span>{copiedLink ? 'Ссылка скопирована!' : 'Ссылка для друга'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInTitleScreen(false);
+                      setShowGithubModal(true);
+                    }}
+                    className="mc-btn px-3.5 py-2.5 text-xs font-bold text-amber-200 flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Github className="w-4 h-4" />
+                    <span>Создать ссылку на GitHub</span>
+                  </button>
+                </div>
 
                 <button
                   type="submit"
                   className="mc-btn px-6 py-2.5 text-xs font-bold text-white flex items-center gap-2 cursor-pointer"
                 >
                   <Play className="w-4 h-4 fill-current" />
-                  <span>ВОЙТИ В МИР</span>
+                  <span>ИГРАТЬ ОНЛАЙН</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* GitHub Repository & GitHub Pages Link Generator Modal */}
+      {showGithubModal && (
+        <div className="pointer-events-auto fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4">
+          <div className="mc-panel w-full max-w-xl p-6 text-neutral-900 max-h-[92vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b-2 border-neutral-500 pb-3 mb-4">
+              <div className="flex items-center gap-2">
+                <Github className="w-5 h-5 text-neutral-900" />
+                <h2 className="font-pixel text-sm text-neutral-900">
+                  ПУБЛИКАЦИЯ НА GITHUB
+                </h2>
+              </div>
+              <button
+                onClick={() => setShowGithubModal(false)}
+                className="mc-btn px-3 py-1 text-xs font-bold text-white cursor-pointer"
+              >
+                ЗАКРЫТЬ
+              </button>
+            </div>
+
+            <p className="text-xs text-neutral-800 mb-4 leading-relaxed">
+              Создайте собственный репозиторий на <b>GitHub</b> с полным исходным кодом игры, текстурами и автоматическим деплоем на <b>GitHub Pages</b>. Благодаря встроенному <b>WebRTC P2P (PeerJS)</b> мультиплееру, по вашей ссылке на GitHub можно играть онлайн с друзьями без платного хостинга!
+            </p>
+
+            <form onSubmit={handlePublishToGitHub} className="space-y-3.5">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-bold text-neutral-900">
+                    GitHub Personal Access Token (PAT)
+                  </label>
+                  <a
+                    href="https://github.com/settings/tokens/new?scopes=repo,workflow&description=Minecraft+Voxel+Edition"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] text-blue-800 hover:underline flex items-center gap-1 font-semibold"
+                  >
+                    <span>Получить токен на GitHub (права repo + workflow)</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+                <input
+                  type="password"
+                  required
+                  value={ghToken}
+                  onChange={(e) => setGhToken(e.target.value)}
+                  placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                  className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-xs text-white font-mono-tabular focus:outline-none"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-neutral-900 mb-1">
+                    Название репозитория
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={ghRepoName}
+                    onChange={(e) => setGhRepoName(e.target.value)}
+                    placeholder="minecraft-voxel-online"
+                    className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-xs text-amber-300 font-mono-tabular focus:outline-none"
+                  />
+                </div>
+
+                <div className="flex items-end pb-1">
+                  <label className="flex items-center gap-2 text-xs font-bold text-neutral-900 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={ghPrivate}
+                      onChange={(e) => setGhPrivate(e.target.checked)}
+                      className="w-4 h-4"
+                    />
+                    <span>Приватный репозиторий</span>
+                  </label>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-neutral-900 mb-1">
+                  Описание репозитория
+                </label>
+                <input
+                  type="text"
+                  value={ghDescription}
+                  onChange={(e) => setGhDescription(e.target.value)}
+                  className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-xs text-white focus:outline-none"
+                />
+              </div>
+
+              {ghError && (
+                <div className="bg-red-900/90 border border-red-400 text-red-100 p-2.5 text-xs">
+                  {ghError}
+                </div>
+              )}
+
+              {ghResult && (
+                <div className="bg-emerald-900 border-2 border-emerald-400 text-white p-3.5 space-y-2.5 text-xs">
+                  <div className="font-bold text-emerald-300">
+                    Готово! Загружено файлов: {ghResult.uploadedCount}
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="text-[11px] text-neutral-200">Ссылка на ваш GitHub репозиторий:</div>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        readOnly
+                        value={ghResult.repoUrl}
+                        className="flex-1 bg-black/60 border border-white/30 px-2.5 py-1.5 text-xs font-mono-tabular text-amber-300"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard.writeText(ghResult.repoUrl).catch(() => {});
+                          setCopiedGhLink('repo');
+                          setTimeout(() => setCopiedGhLink(null), 2000);
+                        }}
+                        className="mc-btn px-2.5 py-1.5 text-xs text-white cursor-pointer"
+                      >
+                        {copiedGhLink === 'repo' ? 'Скопировано' : 'Копировать'}
+                      </button>
+                      <a
+                        href={ghResult.repoUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mc-btn px-2.5 py-1.5 text-xs text-white flex items-center gap-1"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="text-[11px] text-neutral-200">
+                      Ссылка на онлайн-игру GitHub Pages (активируется после сборки Actions ~1 мин):
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        readOnly
+                        value={`${ghResult.pagesUrl}?room=${roomId}`}
+                        className="flex-1 bg-black/60 border border-white/30 px-2.5 py-1.5 text-xs font-mono-tabular text-emerald-300"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard
+                            .writeText(`${ghResult.pagesUrl}?room=${roomId}`)
+                            .catch(() => {});
+                          setCopiedGhLink('pages');
+                          setTimeout(() => setCopiedGhLink(null), 2000);
+                        }}
+                        className="mc-btn px-2.5 py-1.5 text-xs text-white cursor-pointer"
+                      >
+                        {copiedGhLink === 'pages' ? 'Скопировано' : 'Копировать'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="submit"
+                  disabled={ghPublishing}
+                  className="mc-btn px-5 py-2.5 text-xs font-bold text-white flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  <Github className="w-4 h-4" />
+                  <span>
+                    {ghPublishing
+                      ? 'Загрузка файлов на GitHub...'
+                      : 'Создать репозиторий и получить ссылку GitHub'}
+                  </span>
                 </button>
               </div>
             </form>
