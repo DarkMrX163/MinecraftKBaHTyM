@@ -34,7 +34,7 @@ export interface NetworkCallbacks {
     selfId: string;
     seed: number;
     timeOfDay: number;
-    weather: 'clear' | 'rain' | 'snow';
+    weather: 'clear' | 'rain' | 'snow' | 'storm';
     modifiedBlocks: [string, number][];
     players: NetworkPlayerPayload[];
     chatHistory: NetworkChatPayload[];
@@ -45,7 +45,7 @@ export interface NetworkCallbacks {
   onPlayerLeft: (id: string, chat?: NetworkChatPayload) => void;
   onBlockUpdated: (x: number, y: number, z: number, blockId: number) => void;
   onBlockBatchUpdated: (updates: { x: number; y: number; z: number; blockId: number }[]) => void;
-  onWorldEnvUpdated: (timeOfDay: number, weather: 'clear' | 'rain' | 'snow') => void;
+  onWorldEnvUpdated: (timeOfDay: number, weather: 'clear' | 'rain' | 'snow' | 'storm') => void;
   onChatMessage: (chat: NetworkChatPayload) => void;
 }
 
@@ -83,7 +83,7 @@ export class MultiplayerManager {
   private p2pPlayers = new Map<string, NetworkPlayerPayload>();
   private p2pChatHistory: NetworkChatPayload[] = [];
   private p2pTimeOfDay = 0.25;
-  private p2pWeather: 'clear' | 'rain' | 'snow' = 'clear';
+  private p2pWeather: 'clear' | 'rain' | 'snow' | 'storm' = 'clear';
 
   constructor(roomId: string, selfId: string, callbacks: NetworkCallbacks) {
     this.roomId = this.sanitizeRoom(roomId);
@@ -390,7 +390,7 @@ export class MultiplayerManager {
         }
       } else if (data.type === 'world:env') {
         if (typeof data.timeOfDay === 'number') this.p2pTimeOfDay = data.timeOfDay;
-        if (data.weather) this.p2pWeather = data.weather as 'clear' | 'rain' | 'snow';
+        if (data.weather) this.p2pWeather = data.weather as 'clear' | 'rain' | 'snow' | 'storm';
         if (!this.wsConnected) {
           this.callbacks.onWorldEnvUpdated(this.p2pTimeOfDay, this.p2pWeather);
         }
@@ -452,7 +452,7 @@ export class MultiplayerManager {
         selfId: String(data.selfId || this.selfId),
         seed: Number(data.seed) || 42069,
         timeOfDay: typeof data.timeOfDay === 'number' ? data.timeOfDay : 0.25,
-        weather: (data.weather as 'clear' | 'rain' | 'snow') || 'clear',
+        weather: (data.weather as 'clear' | 'rain' | 'snow' | 'storm') || 'clear',
         modifiedBlocks: (data.modifiedBlocks as [string, number][]) || [],
         players: (data.players as NetworkPlayerPayload[]) || [],
         chatHistory: (data.chatHistory as NetworkChatPayload[]) || [],
@@ -485,7 +485,7 @@ export class MultiplayerManager {
     } else if (type === 'world:env_updated') {
       this.callbacks.onWorldEnvUpdated(
         typeof data.timeOfDay === 'number' ? data.timeOfDay : 0.25,
-        (data.weather as 'clear' | 'rain' | 'snow') || 'clear'
+        (data.weather as 'clear' | 'rain' | 'snow' | 'storm') || 'clear'
       );
     } else if (type === 'chat:message') {
       if (data.chat) {
@@ -550,7 +550,7 @@ export class MultiplayerManager {
     }
   }
 
-  public sendWorldEnv(timeOfDay: number, weather: 'clear' | 'rain' | 'snow') {
+  public sendWorldEnv(timeOfDay: number, weather: 'clear' | 'rain' | 'snow' | 'storm') {
     this.p2pTimeOfDay = timeOfDay;
     this.p2pWeather = weather;
     const packet = { type: 'world:env', timeOfDay, weather };

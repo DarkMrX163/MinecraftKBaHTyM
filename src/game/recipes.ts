@@ -103,6 +103,24 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
     inputs: [{ blockId: BlockId.DIAMOND_ORE, count: 4 }],
     output: { blockId: BlockId.DIAMOND_BLOCK, count: 1 },
   },
+  {
+    id: 'enchanting_table_craft',
+    nameRu: 'Стол зачарований (Магия и чары)',
+    inputs: [
+      { blockId: BlockId.COBBLESTONE, count: 4 },
+      { blockId: BlockId.OAK_PLANKS, count: 2 },
+    ],
+    output: { blockId: BlockId.ENCHANTING_TABLE, count: 1 },
+  },
+  {
+    id: 'brewing_stand_craft',
+    nameRu: 'Варочная стойка (Зельеварение)',
+    inputs: [
+      { blockId: BlockId.COBBLESTONE, count: 3 },
+      { blockId: BlockId.GLOWSTONE, count: 1 },
+    ],
+    output: { blockId: BlockId.BREWING_STAND, count: 1 },
+  },
 ];
 
 export const INITIAL_HOTBAR: InventorySlot[] = [
@@ -110,8 +128,8 @@ export const INITIAL_HOTBAR: InventorySlot[] = [
   { blockId: BlockId.COBBLESTONE, count: 64 },
   { blockId: BlockId.OAK_PLANKS, count: 64 },
   { blockId: BlockId.DOOR_CLOSED, count: 8 },
-  { blockId: BlockId.GLASS, count: 32 },
-  { blockId: BlockId.BRICK, count: 32 },
+  { blockId: BlockId.ENCHANTING_TABLE, count: 2 },
+  { blockId: BlockId.BREWING_STAND, count: 2 },
   { blockId: BlockId.GLOWSTONE, count: 16 },
   { blockId: BlockId.CRAFTING_TABLE, count: 4 },
   { blockId: BlockId.TNT, count: 16 },

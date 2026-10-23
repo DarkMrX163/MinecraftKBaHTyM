@@ -125,6 +125,10 @@ export class VoxelWorld {
   private scene: THREE.Scene;
   public solidMaterial: THREE.MeshLambertMaterial;
   public transparentMaterial: THREE.MeshLambertMaterial;
+  public shaderUniforms = {
+    uTime: { value: 0 },
+    uSwayEnabled: { value: 1.0 },
+  };
 
   constructor(scene: THREE.Scene, atlasTexture: THREE.Texture, seed = 42069) {
     this.scene = scene;
@@ -142,6 +146,29 @@ export class VoxelWorld {
       vertexColors: true,
     });
 
+    // Next-Gen Swaying Foliage Shader (Oak Leaves & Grass gently sway in the wind)
+    this.solidMaterial.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.shaderUniforms.uTime;
+      shader.uniforms.uSwayEnabled = this.shaderUniforms.uSwayEnabled;
+      shader.vertexShader =
+        `uniform float uTime;\nuniform float uSwayEnabled;\n` + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        // Tile 8 (OAK_LEAVES): col 0, row 1 -> uv.x in [0, 0.125], uv.y in [0.75, 0.875]
+        bool isLeaves = (uv.x < 0.125 && uv.y >= 0.75 && uv.y < 0.875);
+        if (isLeaves && uSwayEnabled > 0.5) {
+          float waveX = sin(uTime * 2.2 + position.x * 0.75 + position.z * 0.65 + position.y * 0.5) * 0.065;
+          float waveZ = cos(uTime * 1.9 + position.z * 0.75 + position.x * 0.55) * 0.055;
+          float waveY = sin(uTime * 1.6 + position.x * 0.9 + position.z * 0.9) * 0.025;
+          transformed.x += waveX;
+          transformed.z += waveZ;
+          transformed.y += waveY;
+        }`
+      );
+    };
+    this.solidMaterial.customProgramCacheKey = () => 'voxel-solid-sway-v2';
+
     this.transparentMaterial = new THREE.MeshLambertMaterial({
       map: atlasTexture,
       vertexColors: true,
@@ -149,6 +176,24 @@ export class VoxelWorld {
       alphaTest: 0.05,
       depthWrite: false,
     });
+
+    // Next-Gen Water Ripple Shader
+    this.transparentMaterial.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = this.shaderUniforms.uTime;
+      shader.uniforms.uSwayEnabled = this.shaderUniforms.uSwayEnabled;
+      shader.vertexShader =
+        `uniform float uTime;\nuniform float uSwayEnabled;\n` + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        // Tile 11 (WATER): col 3, row 1 -> uv.x in [0.375, 0.5], uv.y in [0.75, 0.875]
+        bool isWater = (uv.x >= 0.375 && uv.x < 0.5 && uv.y >= 0.75 && uv.y < 0.875);
+        if (isWater && uSwayEnabled > 0.5) {
+          transformed.y += sin(uTime * 2.8 + position.x * 0.85 + position.z * 0.85) * 0.045;
+        }`
+      );
+    };
+    this.transparentMaterial.customProgramCacheKey = () => 'voxel-trans-water-v2';
   }
 
   public setSeed(newSeed: number) {
@@ -240,6 +285,17 @@ export class VoxelWorld {
     { id: 'v_south', nameRu: 'Южная Застава', x: 24, z: 56, baseY: 18, biome: 'plains' },
   ];
 
+  public static readonly DUNGEON_LOCATIONS: {
+    id: string;
+    nameRu: string;
+    x: number;
+    y: number;
+    z: number;
+  }[] = [
+    { id: 'd_diamond', nameRu: 'Алмазное Подземелье', x: 18, y: 8, z: -18 },
+    { id: 'd_ancient', nameRu: 'Склеп Древних Руд', x: -24, y: 8, z: -20 },
+  ];
+
   public generateChunkData(cx: number, cz: number): Uint8Array {
     const key = `${cx},${cz}`;
     const existing = this.chunks.get(key);
@@ -268,18 +324,18 @@ export class VoxelWorld {
           if (ly === 0) {
             blockId = BlockId.BEDROCK;
           } else if (ly < height - 3) {
-            const cave = this.caveNoise3D(wx * 0.06, ly * 0.08, wz * 0.06);
-            if (ly > 3 && cave > 0.66) {
+            const cave = this.caveNoise3D(wx * 0.065, ly * 0.085, wz * 0.065);
+            if (ly > 3 && cave > 0.6) {
               blockId = BlockId.AIR;
             } else {
               const oreNoise = this.caveNoise3D(wx * 0.22 + 100, ly * 0.22, wz * 0.22);
-              if (oreNoise > 0.76 && ly < 12) {
+              if (oreNoise > 0.72 && ly < 14) {
                 blockId = BlockId.DIAMOND_ORE;
-              } else if (oreNoise > 0.73 && ly < 18) {
+              } else if (oreNoise > 0.69 && ly < 20) {
                 blockId = BlockId.GOLD_ORE;
-              } else if (oreNoise > 0.69 && ly < 28) {
+              } else if (oreNoise > 0.65 && ly < 28) {
                 blockId = BlockId.IRON_ORE;
-              } else if (oreNoise > 0.65) {
+              } else if (oreNoise > 0.61) {
                 blockId = BlockId.COAL_ORE;
               } else {
                 blockId = BlockId.STONE;
@@ -315,6 +371,85 @@ export class VoxelWorld {
         data[this.getLocalIndex(lx, wy, lz)] = id;
       }
     };
+
+    // Build Underground Caves & Dungeons (Caves & Dungeons) with rare Diamond/Gold ores, Mossy Cobblestone, Lava, and Treasure Chests
+    for (const d of VoxelWorld.DUNGEON_LOCATIONS) {
+      if (Math.abs(startX + 8 - d.x) > 22 || Math.abs(startZ + 8 - d.z) > 22) continue;
+      const dyBase = d.y;
+      const rx = 4;
+      const rz = 4;
+      const roomH = 5;
+
+      for (let dx = -rx; dx <= rx; dx++) {
+        for (let dz = -rz; dz <= rz; dz++) {
+          const wx = d.x + dx;
+          const wz = d.z + dz;
+          const isWall = Math.abs(dx) === rx || Math.abs(dz) === rz;
+          const isCorner = Math.abs(dx) === rx && Math.abs(dz) === rz;
+
+          // Dungeon floor: Mossy Cobblestone & Gold/Diamond veins
+          setWorldVoxelInChunk(
+            wx,
+            dyBase,
+            wz,
+            (dx + dz) % 2 === 0 ? BlockId.MOSSY_COBBLESTONE : BlockId.COBBLESTONE
+          );
+
+          for (let hy = 1; hy <= roomH; hy++) {
+            if (hy === roomH) {
+              setWorldVoxelInChunk(wx, dyBase + hy, wz, BlockId.MOSSY_COBBLESTONE);
+            } else if (isCorner) {
+              setWorldVoxelInChunk(
+                wx,
+                dyBase + hy,
+                wz,
+                hy === 2 ? BlockId.LAVA : BlockId.OBSIDIAN
+              );
+            } else if (isWall) {
+              // Rich Diamond & Gold ore veins embedded in the dungeon walls
+              if (hy === 2 && (dx === 0 || dz === 0)) {
+                setWorldVoxelInChunk(wx, dyBase + hy, wz, BlockId.DIAMOND_ORE);
+              } else if (hy === 3 && (Math.abs(dx) === 2 || Math.abs(dz) === 2)) {
+                setWorldVoxelInChunk(wx, dyBase + hy, wz, BlockId.GOLD_ORE);
+              } else {
+                setWorldVoxelInChunk(
+                  wx,
+                  dyBase + hy,
+                  wz,
+                  (wx + hy + wz) % 2 === 0 ? BlockId.MOSSY_COBBLESTONE : BlockId.COBBLESTONE
+                );
+              }
+            } else {
+              // Clear interior dungeon air
+              setWorldVoxelInChunk(wx, dyBase + hy, wz, BlockId.AIR);
+            }
+          }
+        }
+      }
+
+      // Dungeon Treasure Altar in the center: Treasure Chest, Enchanting Table, Brewing Stand, Diamond & Gold blocks
+      setWorldVoxelInChunk(d.x, dyBase + 1, d.z, BlockId.TREASURE_CHEST);
+      setWorldVoxelInChunk(d.x - 1, dyBase + 1, d.z, BlockId.DIAMOND_ORE);
+      setWorldVoxelInChunk(d.x + 1, dyBase + 1, d.z, BlockId.GOLD_ORE);
+      setWorldVoxelInChunk(d.x, dyBase + 1, d.z - 2, BlockId.ENCHANTING_TABLE);
+      setWorldVoxelInChunk(d.x, dyBase + 1, d.z + 2, BlockId.BREWING_STAND);
+      setWorldVoxelInChunk(d.x, dyBase + roomH - 1, d.z, BlockId.GLOWSTONE);
+
+      // Stepped Cave Entrance Tunnel leading from surface down into the dungeon
+      const surfY = this.getTerrainHeight(d.x + rx, d.z).height;
+      for (let sy = dyBase + 1; sy <= surfY + 2; sy++) {
+        setWorldVoxelInChunk(d.x + rx, sy, d.z, BlockId.AIR);
+        setWorldVoxelInChunk(d.x + rx, sy, d.z + 1, BlockId.AIR);
+        if (sy % 4 === 0) {
+          setWorldVoxelInChunk(d.x + rx, sy, d.z - 1, BlockId.GLOWSTONE);
+        }
+      }
+      // Surface Dungeon Portal Archway
+      setWorldVoxelInChunk(d.x + rx, surfY + 1, d.z - 1, BlockId.MOSSY_COBBLESTONE);
+      setWorldVoxelInChunk(d.x + rx, surfY + 2, d.z - 1, BlockId.GLOWSTONE);
+      setWorldVoxelInChunk(d.x + rx, surfY + 1, d.z + 2, BlockId.MOSSY_COBBLESTONE);
+      setWorldVoxelInChunk(d.x + rx, surfY + 2, d.z + 2, BlockId.GLOWSTONE);
+    }
 
     // Build Village Houses, Paths, Wells, and Treasure Chests if chunk overlaps a village
     for (const v of VoxelWorld.VILLAGE_CENTERS) {
@@ -413,12 +548,15 @@ export class VoxelWorld {
           }
         }
 
-        // Interior furnishings: Glowstone lamp, Bookshelf, Crafting Table, and Treasure Chest
+        // Interior furnishings: Glowstone lamp, Bookshelf, Crafting/Enchanting/Brewing stations, and Treasure Chest
         setWorldVoxelInChunk(h.hx + 1, by + 1, h.hz + 1, BlockId.CRAFTING_TABLE);
+        setWorldVoxelInChunk(h.hx + 2, by + 1, h.hz + 1, BlockId.ENCHANTING_TABLE);
         setWorldVoxelInChunk(h.hx + 4, by + 1, h.hz + 1, BlockId.BOOKSHELF);
         setWorldVoxelInChunk(h.hx + 4, by + 2, h.hz + 1, BlockId.GLOWSTONE);
         if (h.hasChest) {
           setWorldVoxelInChunk(h.hx + 1, by + 1, h.hz + 4, BlockId.TREASURE_CHEST);
+        } else {
+          setWorldVoxelInChunk(h.hx + 1, by + 1, h.hz + 4, BlockId.BREWING_STAND);
         }
       }
     }
@@ -475,12 +613,14 @@ export class VoxelWorld {
       }
     }
 
-    // Place a starter Crafting Table and Furnace right next to spawn (3, height+1, 3)
+    // Place a starter Crafting Table, Enchanting Table, Brewing Stand, and Furnace right next to spawn
     if (cx === 0 && cz === 0) {
       const hCraft = this.getTerrainHeight(3, 3).height;
       if (hCraft > WATER_LEVEL) {
+        data[this.getLocalIndex(2, hCraft + 1, 3)] = BlockId.ENCHANTING_TABLE;
         data[this.getLocalIndex(3, hCraft + 1, 3)] = BlockId.CRAFTING_TABLE;
         data[this.getLocalIndex(4, hCraft + 1, 3)] = BlockId.FURNACE;
+        data[this.getLocalIndex(5, hCraft + 1, 3)] = BlockId.BREWING_STAND;
         data[this.getLocalIndex(3, hCraft + 2, 3)] = BlockId.GLOWSTONE;
       }
     }
@@ -636,6 +776,9 @@ export class VoxelWorld {
             // Lower top of water block slightly for authentic shoreline look
             const yTopOffset = blockId === BlockId.WATER ? -0.12 : 0;
 
+            // Next-Gen Enhanced SSAO / Deep Multi-Sample Cavity Ambient Occlusion Curve
+            const aoCurve = [1.0, 0.74, 0.51, 0.31];
+
             for (const corner of face.corners) {
               const py = corner.pos[1] === 1 ? 1 + yTopOffset : 0;
               posArr.push(wx + corner.pos[0], wy + py, wz + corner.pos[2]);
@@ -645,19 +788,27 @@ export class VoxelWorld {
               const v = corner.uv[1] === 0 ? v0 : v1;
               uvArr.push(u, v);
 
-              // Vertex Ambient Occlusion (AO)
               let occ = 0;
               if (!isTrans && !def.lightLevel) {
                 const [d1, d2, d3] = corner.aoDirs;
-                if (this.isOccludingBlock(wx + d1[0], wy + d1[1], wz + d1[2])) occ++;
-                if (this.isOccludingBlock(wx + d2[0], wy + d2[1], wz + d2[2])) occ++;
-                if (this.isOccludingBlock(wx + d3[0], wy + d3[1], wz + d3[2])) occ++;
+                const s1 = this.isOccludingBlock(wx + d1[0], wy + d1[1], wz + d1[2]);
+                const s2 = this.isOccludingBlock(wx + d2[0], wy + d2[1], wz + d2[2]);
+                const s3 = this.isOccludingBlock(wx + d3[0], wy + d3[1], wz + d3[2]);
+                if (s1 && s2) {
+                  occ = 3;
+                } else {
+                  occ = (s1 ? 1 : 0) + (s2 ? 1 : 0) + (s3 ? 1 : 0);
+                }
               }
 
-              const aoFactor = 1.0 - occ * 0.16;
-              const lightBoost = def.lightLevel ? 1.15 : 1.0;
-              const c = Math.min(1.0, face.shade * aoFactor * lightBoost);
-              colArr.push(c, c, c);
+              const aoFactor = aoCurve[occ] ?? 0.31;
+              if (def.lightLevel) {
+                // Boost emissive vertex brightness for Bloom post-processing on Glowstone, Lava, Enchanting Table
+                colArr.push(1.25, 1.18, 1.05);
+              } else {
+                const c = Math.min(1.0, face.shade * aoFactor);
+                colArr.push(c, c, c);
+              }
             }
 
             idxArr.push(ndx, ndx + 1, ndx + 2, ndx, ndx + 2, ndx + 3);

@@ -32,6 +32,10 @@ export enum BlockId {
   DOOR_OPEN = 28,
   TREASURE_CHEST = 29,
   EMERALD_BLOCK = 30,
+  ENCHANTING_TABLE = 31,
+  BREWING_STAND = 32,
+  MOSSY_COBBLESTONE = 33,
+  LAVA = 34,
 }
 
 export interface BlockDefinition {
@@ -97,6 +101,12 @@ export const TILE_INDEX = {
   CHEST_SIDE: 39,
   CHEST_FRONT: 40,
   EMERALD_BLOCK: 41,
+  ENCHANT_TOP: 42,
+  ENCHANT_SIDE: 43,
+  BREWING_TOP: 44,
+  BREWING_SIDE: 45,
+  MOSSY_COBBLESTONE: 46,
+  LAVA: 47,
 };
 
 export const BLOCKS: Record<number, BlockDefinition> = {
@@ -567,6 +577,69 @@ export const BLOCKS: Record<number, BlockDefinition> = {
     ],
     iconTile: TILE_INDEX.EMERALD_BLOCK,
   },
+  [BlockId.ENCHANTING_TABLE]: {
+    id: BlockId.ENCHANTING_TABLE,
+    name: 'Enchanting Table',
+    nameRu: 'Стол зачарований (ПКМ — чары)',
+    lightLevel: 12,
+    hardness: 1.5,
+    faces: [
+      TILE_INDEX.ENCHANT_TOP,
+      TILE_INDEX.OBSIDIAN,
+      TILE_INDEX.ENCHANT_SIDE,
+      TILE_INDEX.ENCHANT_SIDE,
+      TILE_INDEX.ENCHANT_SIDE,
+      TILE_INDEX.ENCHANT_SIDE,
+    ],
+    iconTile: TILE_INDEX.ENCHANT_SIDE,
+  },
+  [BlockId.BREWING_STAND]: {
+    id: BlockId.BREWING_STAND,
+    name: 'Brewing Stand',
+    nameRu: 'Варочная стойка (ПКМ — зелья)',
+    lightLevel: 10,
+    hardness: 1.2,
+    faces: [
+      TILE_INDEX.BREWING_TOP,
+      TILE_INDEX.COBBLESTONE,
+      TILE_INDEX.BREWING_SIDE,
+      TILE_INDEX.BREWING_SIDE,
+      TILE_INDEX.BREWING_SIDE,
+      TILE_INDEX.BREWING_SIDE,
+    ],
+    iconTile: TILE_INDEX.BREWING_SIDE,
+  },
+  [BlockId.MOSSY_COBBLESTONE]: {
+    id: BlockId.MOSSY_COBBLESTONE,
+    name: 'Mossy Cobblestone',
+    nameRu: 'Замшелый булыжник (Данж)',
+    hardness: 1.4,
+    faces: [
+      TILE_INDEX.MOSSY_COBBLESTONE,
+      TILE_INDEX.MOSSY_COBBLESTONE,
+      TILE_INDEX.MOSSY_COBBLESTONE,
+      TILE_INDEX.MOSSY_COBBLESTONE,
+      TILE_INDEX.MOSSY_COBBLESTONE,
+      TILE_INDEX.MOSSY_COBBLESTONE,
+    ],
+    iconTile: TILE_INDEX.MOSSY_COBBLESTONE,
+  },
+  [BlockId.LAVA]: {
+    id: BlockId.LAVA,
+    name: 'Lava',
+    nameRu: 'Светящаяся лава',
+    lightLevel: 15,
+    hardness: 1.0,
+    faces: [
+      TILE_INDEX.LAVA,
+      TILE_INDEX.LAVA,
+      TILE_INDEX.LAVA,
+      TILE_INDEX.LAVA,
+      TILE_INDEX.LAVA,
+      TILE_INDEX.LAVA,
+    ],
+    iconTile: TILE_INDEX.LAVA,
+  },
 };
 
 export const PLACEABLE_BLOCKS: BlockId[] = [
@@ -574,10 +647,13 @@ export const PLACEABLE_BLOCKS: BlockId[] = [
   BlockId.DIRT,
   BlockId.STONE,
   BlockId.COBBLESTONE,
+  BlockId.MOSSY_COBBLESTONE,
   BlockId.OAK_LOG,
   BlockId.OAK_PLANKS,
   BlockId.DOOR_CLOSED,
   BlockId.CRAFTING_TABLE,
+  BlockId.ENCHANTING_TABLE,
+  BlockId.BREWING_STAND,
   BlockId.FURNACE,
   BlockId.TREASURE_CHEST,
   BlockId.GLASS,
@@ -588,6 +664,7 @@ export const PLACEABLE_BLOCKS: BlockId[] = [
   BlockId.OAK_LEAVES,
   BlockId.BOOKSHELF,
   BlockId.GLOWSTONE,
+  BlockId.LAVA,
   BlockId.TNT,
   BlockId.EMERALD_BLOCK,
   BlockId.DIAMOND_BLOCK,
@@ -993,6 +1070,78 @@ export function getMinecraftAtlas(): GeneratedAtlas {
     drawPixel(TILE_INDEX.EMERALD_BLOCK, 0, i, '#7affa2');
     drawPixel(TILE_INDEX.EMERALD_BLOCK, i, 15, '#128034');
     drawPixel(TILE_INDEX.EMERALD_BLOCK, 15, i, '#128034');
+  }
+
+  // 42, 43: ENCHANTING TABLE (Red cloth + diamond corners + obsidian base + floating grimoire pages)
+  fillNoiseTile(TILE_INDEX.ENCHANT_TOP, '#a31d24', 14);
+  for (let i = 0; i < 16; i++) {
+    drawPixel(TILE_INDEX.ENCHANT_TOP, i, 0, '#5decf5');
+    drawPixel(TILE_INDEX.ENCHANT_TOP, i, 15, '#5decf5');
+    drawPixel(TILE_INDEX.ENCHANT_TOP, 0, i, '#5decf5');
+    drawPixel(TILE_INDEX.ENCHANT_TOP, 15, i, '#5decf5');
+  }
+  // Open spellbook in center of Enchanting Table top
+  for (let y = 5; y <= 10; y++) {
+    for (let x = 4; x <= 11; x++) {
+      drawPixel(TILE_INDEX.ENCHANT_TOP, x, y, x === 7 || x === 8 ? '#6e4720' : '#f5ebd6');
+    }
+  }
+
+  fillNoiseTile(TILE_INDEX.ENCHANT_SIDE, '#1b1429', 14);
+  for (let x = 0; x < 16; x++) {
+    for (let y = 0; y < 5; y++) {
+      drawPixel(TILE_INDEX.ENCHANT_SIDE, x, y, y === 4 ? '#fcee4b' : '#b82028');
+    }
+    if (x % 4 === 0) {
+      drawPixel(TILE_INDEX.ENCHANT_SIDE, x, 6, '#5decf5');
+      drawPixel(TILE_INDEX.ENCHANT_SIDE, x, 7, '#5decf5');
+    }
+  }
+
+  // 44, 45: BREWING STAND (Blaze rod + 3 glowing potion bottles on cobblestone base)
+  fillNoiseTile(TILE_INDEX.BREWING_TOP, '#525252', 14);
+  for (let i = 5; i <= 10; i++) {
+    drawPixel(TILE_INDEX.BREWING_TOP, i, 7, '#ffaa22');
+    drawPixel(TILE_INDEX.BREWING_TOP, 7, i, '#ffaa22');
+  }
+  fillNoiseTile(TILE_INDEX.BREWING_SIDE, '#2a2433', 12);
+  for (let x = 0; x < 16; x++) {
+    for (let y = 12; y < 16; y++) {
+      drawPixel(TILE_INDEX.BREWING_SIDE, x, y, shadeHex('#6b6b6b', ((x + y) % 3) * 8));
+    }
+  }
+  // Golden Blaze Rod in center
+  for (let y = 2; y < 12; y++) {
+    drawPixel(TILE_INDEX.BREWING_SIDE, 7, y, '#ffcc33');
+    drawPixel(TILE_INDEX.BREWING_SIDE, 8, y, '#ff9911');
+  }
+  // Left & Right Glowing Potion Flasks
+  for (let y = 6; y <= 11; y++) {
+    for (let x = 2; x <= 5; x++) {
+      drawPixel(TILE_INDEX.BREWING_SIDE, x, y, y > 7 ? '#ff3388' : '#b8fdff');
+    }
+    for (let x = 10; x <= 13; x++) {
+      drawPixel(TILE_INDEX.BREWING_SIDE, x, y, y > 7 ? '#33ff77' : '#b8fdff');
+    }
+  }
+
+  // 46: MOSSY COBBLESTONE (Dungeon stone overgrown with green vines)
+  fillNoiseTile(TILE_INDEX.MOSSY_COBBLESTONE, '#636363', 24);
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      if ((x * 3 + y * 5) % 7 === 0 || (x + y) % 6 === 0) {
+        drawPixel(TILE_INDEX.MOSSY_COBBLESTONE, x, y, shadeHex('#4a8528', Math.floor((rand() - 0.5) * 20)));
+      }
+    }
+  }
+
+  // 47: LAVA (Glowing orange-yellow molten magma for Bloom & Dungeons)
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      const wave = Math.sin(x * 0.6 + y * 0.4);
+      const c = wave > 0.45 ? '#fff36b' : wave > -0.2 ? '#ff7b14' : '#c93208';
+      drawPixel(TILE_INDEX.LAVA, x, y, c);
+    }
   }
 
   const texture = new THREE.CanvasTexture(canvas);

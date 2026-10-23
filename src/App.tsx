@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import {
   BlockId,
   BLOCKS,
@@ -15,6 +19,8 @@ import {
   PassiveMobModel,
   VillagerMobModel,
   HostileMobModel,
+  HostileMobKind,
+  WolfPetModel,
   SKIN_PALETTES,
 } from './game/playerModel';
 import {
@@ -47,13 +53,15 @@ import {
   Play,
   Sparkles,
   Hammer,
-  Github,
   Globe,
-  ExternalLink,
   RefreshCw,
   Compass,
   MapPin,
   Sword,
+  Zap,
+  FlaskConical,
+  Wand2,
+  Dog,
 } from 'lucide-react';
 
 interface ParticleBurst {
@@ -80,15 +88,91 @@ interface WorldEventQuest {
   foundCount: number;
 }
 
+export interface PlayerEnchantments {
+  efficiency: boolean; // Эффективность III (быстрая добыча блоков)
+  sharpness: boolean;  // Острота III (двойной урон по монстрам)
+  fortune: boolean;    // Удача III (x2 ресурсов при добыче руд и блоков)
+}
+
+export interface PlayerPotions {
+  speed: number;       // Зелье Скорости (seconds remaining)
+  nightVision: number; // Зелье Ночного Зрения (seconds remaining)
+  regen: number;       // Зелье Регенерации (seconds remaining)
+}
+
 // Reusable module-scope math vectors to prevent GC in animation loop
 const _forward = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _rayDir = new THREE.Vector3();
 const _camTarget = new THREE.Vector3();
 const _skyDay = new THREE.Color('#78a7ff');
-const _skySunset = new THREE.Color('#d97d54');
+const _skySunset = new THREE.Color('#e87a48');
 const _skyNight = new THREE.Color('#0a0f24');
 const _curSky = new THREE.Color();
+
+// Custom Next-Gen Post-Processing Shader: SSAO Cavity Contrast + Distant Depth-of-Field + Dynamic Sunset Grading
+const NextGenPostShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uSunsetFactor: { value: 0.0 },
+    uNightVision: { value: 0.0 },
+    uLightningFlash: { value: 0.0 },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D tDiffuse;
+    uniform float uSunsetFactor;
+    uniform float uNightVision;
+    uniform float uLightningFlash;
+    varying vec2 vUv;
+
+    void main() {
+      vec4 base = texture2D(tDiffuse, vUv);
+      vec3 col = base.rgb;
+
+      // Subtle Depth of Field & Screen-Space Micro-Contrast near screen edges
+      vec2 centered = vUv - vec2(0.5);
+      float radialDist = length(centered);
+      if (radialDist > 0.28) {
+        float blurAmt = smoothstep(0.28, 0.72, radialDist) * 0.0022;
+        vec3 b1 = texture2D(tDiffuse, vUv + vec2(blurAmt, 0.0)).rgb;
+        vec3 b2 = texture2D(tDiffuse, vUv - vec2(blurAmt, 0.0)).rgb;
+        vec3 b3 = texture2D(tDiffuse, vUv + vec2(0.0, blurAmt)).rgb;
+        vec3 b4 = texture2D(tDiffuse, vUv - vec2(0.0, blurAmt)).rgb;
+        vec3 blurred = (b1 + b2 + b3 + b4) * 0.25;
+        col = mix(col, blurred, 0.35);
+      }
+
+      // Dynamic Sunset / Sunrise warm golden-purple color grading
+      if (uSunsetFactor > 0.01) {
+        vec3 sunsetTint = vec3(1.14, 0.96, 0.86);
+        col = mix(col, col * sunsetTint, uSunsetFactor * 0.55);
+      }
+
+      // Night Vision Alchemical Potion effect
+      if (uNightVision > 0.01) {
+        col = pow(col, vec3(0.76)) * vec3(0.92, 1.18, 1.02);
+      }
+
+      // Thunderstorm Lightning Flash
+      if (uLightningFlash > 0.01) {
+        col = mix(col, vec3(0.9, 0.95, 1.0), uLightningFlash * 0.55);
+      }
+
+      // Soft SSAO-style vignette & S-curve contrast
+      float vig = smoothstep(0.85, 0.25, radialDist);
+      col *= mix(0.82, 1.03, vig);
+
+      gl_FragColor = vec4(col, base.a);
+    }
+  `,
+};
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
@@ -142,6 +226,20 @@ export default function App() {
   const [isTouchDevice, setIsTouchDevice] = useState<boolean>(false);
   const [showMiniMap, setShowMiniMap] = useState<boolean>(true);
   const [autoDayNight, setAutoDayNight] = useState<boolean>(true);
+  const [nextGenShaders, setNextGenShaders] = useState<boolean>(true);
+
+  // Enchanting & Brewing Progression States
+  const [enchantments, setEnchantments] = useState<PlayerEnchantments>({
+    efficiency: true,
+    sharpness: true,
+    fortune: false,
+  });
+  const [potions, setPotions] = useState<PlayerPotions>({
+    speed: 0,
+    nightVision: 0,
+    regen: 0,
+  });
+  const [petCount, setPetCount] = useState<number>(2);
 
   // Inventory & Hotbar
   const [hotbar, setHotbar] = useState<InventorySlot[]>(INITIAL_HOTBAR);
@@ -190,7 +288,7 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState<NetworkChatPayload[]>([]);
   const [chatDraft, setChatDraft] = useState<string>('');
   const [timeOfDay, setTimeOfDay] = useState<number>(0.25); // 0.25 = Noon, 0.75 = Midnight
-  const [weather, setWeather] = useState<'clear' | 'rain' | 'snow'>('clear');
+  const [weather, setWeather] = useState<'clear' | 'rain' | 'snow' | 'storm'>('clear');
 
   // Mutable refs for 60fps Three.js game loop access
   const stateRef = useRef({
@@ -211,6 +309,9 @@ export default function App() {
     autoDayNight,
     showMiniMap,
     activeQuest,
+    nextGenShaders,
+    enchantments,
+    potions,
   });
 
   useEffect(() => {
@@ -232,6 +333,9 @@ export default function App() {
       autoDayNight,
       showMiniMap,
       activeQuest,
+      nextGenShaders,
+      enchantments,
+      potions,
     };
   }, [
     inTitleScreen,
@@ -251,6 +355,9 @@ export default function App() {
     autoDayNight,
     showMiniMap,
     activeQuest,
+    nextGenShaders,
+    enchantments,
+    potions,
   ]);
 
   // Refs to engine instances
@@ -442,29 +549,71 @@ export default function App() {
   );
 
   // Sync environment change to server & P2P peers
-  const updateWorldEnv = useCallback((newTime?: number, newWeather?: 'clear' | 'rain' | 'snow') => {
-    soundEngine.playClick();
-    const t = typeof newTime === 'number' ? newTime : stateRef.current.timeOfDay;
-    const w = newWeather || stateRef.current.weather;
-    setTimeOfDay(t);
-    stateRef.current.timeOfDay = t;
-    setWeather(w);
-    if (netRef.current) {
-      netRef.current.sendWorldEnv(t, w);
-    }
-  }, []);
+  const updateWorldEnv = useCallback(
+    (newTime?: number, newWeather?: 'clear' | 'rain' | 'snow' | 'storm') => {
+      soundEngine.playClick();
+      const t = typeof newTime === 'number' ? newTime : stateRef.current.timeOfDay;
+      const w = newWeather || stateRef.current.weather;
+      setTimeOfDay(t);
+      stateRef.current.timeOfDay = t;
+      setWeather(w);
+      if (netRef.current) {
+        netRef.current.sendWorldEnv(t, w);
+      }
+    },
+    []
+  );
 
-  // Teleport helper for quick navigation to Spawn, Village, or Quest
-  const teleportPlayerTo = useCallback((tx: number, tz: number, label: string) => {
+  // Teleport helper for quick navigation to Spawn, Village, Dungeon, or Quest
+  const teleportPlayerTo = useCallback((tx: number, tz: number, label: string, customY?: number) => {
     const world = worldRef.current;
     if (!world) return;
     soundEngine.playClick();
     world.updateChunksAroundPlayer(tx, tz, 2);
-    const ty = world.getTerrainHeight(Math.floor(tx), Math.floor(tz)).height;
-    playerPosRef.current.set(tx + 0.5, Math.max(ty + 1.2, WATER_LEVEL + 2), tz + 0.5);
+    const ty =
+      typeof customY === 'number'
+        ? customY
+        : Math.max(world.getTerrainHeight(Math.floor(tx), Math.floor(tz)).height + 1.2, WATER_LEVEL + 2);
+    playerPosRef.current.set(tx + 0.5, ty, tz + 0.5);
     playerVelRef.current.set(0, 0, 0);
-    setEventBanner(`Перемещение: ${label} (${tx}, ${tz})`);
+    setEventBanner(`Перемещение: ${label} (${tx}, ${Math.floor(ty)}, ${tz})`);
     setTimeout(() => setEventBanner(null), 3200);
+  }, []);
+
+  // Brew / Drink Potion helper
+  const handleBrewPotion = useCallback((potionType: 'speed' | 'nightVision' | 'regen') => {
+    soundEngine.playMagicChime();
+    setPotions((prev) => ({
+      ...prev,
+      [potionType]: 120, // 2 minutes active buff
+    }));
+    if (potionType === 'regen') {
+      setHealth(20);
+      setHunger(20);
+    }
+    const labels: Record<string, string> = {
+      speed: '🧪 Выпито Зелье Стремительности II (+65% к скорости бега на 120 сек)!',
+      nightVision: '🧪 Выпито Зелье Ночного Зрения (кристальная видимость ночью и в пещерах на 120 сек)!',
+      regen: '🧪 Выпито Зелье Исцеления и Регенерации (здоровье 20/20 + авто-регенерация)!',
+    };
+    setEventBanner(labels[potionType]);
+    setTimeout(() => setEventBanner(null), 4000);
+  }, []);
+
+  // Toggle Enchantment helper
+  const handleToggleEnchantment = useCallback((key: keyof PlayerEnchantments) => {
+    soundEngine.playMagicChime();
+    setEnchantments((prev) => {
+      const nextVal = !prev[key];
+      const names: Record<keyof PlayerEnchantments, string> = {
+        efficiency: '✨ Чары «Эффективность III» (3x быстрая кирка)',
+        sharpness: '⚔️ Чары «Острота III» (двойной урон по монстрам)',
+        fortune: '💎 Чары «Удача III» (x2 ресурсов при добыче руд и блоков)',
+      };
+      setEventBanner(`${names[key]}: ${nextVal ? 'АКТИВИРОВАНЫ' : 'ОТКЛЮЧЕНЫ'}`);
+      setTimeout(() => setEventBanner(null), 3500);
+      return { ...prev, [key]: nextVal };
+    });
   }, []);
 
   // Main Three.js & Dual-Transport Online Multiplayer Initialization
@@ -508,6 +657,27 @@ export default function App() {
       200
     );
 
+    // Next-Gen Post-Processing Composer (UnrealBloomPass + Custom SSAO/DoF/Sunset Grading ShaderPass)
+    let composer: EffectComposer | null = null;
+    let bloomPass: UnrealBloomPass | null = null;
+    let gradePass: ShaderPass | null = null;
+    if (!isSoftwareGl) {
+      composer = new EffectComposer(renderer);
+      const renderPass = new RenderPass(scene, camera);
+      composer.addPass(renderPass);
+
+      bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(window.innerWidth, window.innerHeight),
+        0.26, // strength
+        0.45, // radius
+        0.82  // threshold so Glowstone, Lava, Sun, and Enchanting tables glow richly
+      );
+      composer.addPass(bloomPass);
+
+      gradePass = new ShaderPass(NextGenPostShader);
+      composer.addPass(gradePass);
+    }
+
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
     pmremGenerator.dispose();
@@ -533,14 +703,47 @@ export default function App() {
     const celestialGroup = new THREE.Group();
     const sunMesh = new THREE.Mesh(
       new THREE.BoxGeometry(10, 10, 10),
-      new THREE.MeshBasicMaterial({ color: '#fff380' })
+      new THREE.MeshBasicMaterial({ color: '#fff599' })
     );
     const moonMesh = new THREE.Mesh(
       new THREE.BoxGeometry(8, 8, 8),
       new THREE.MeshBasicMaterial({ color: '#dce8ff' })
     );
+
+    // Next-Gen Volumetric God Rays (Солнечные лучи) streaming from the Sun
+    const godRaysGroup = new THREE.Group();
+    const godRayMats: THREE.MeshBasicMaterial[] = [];
+    for (let i = 0; i < 6; i++) {
+      const coneGeo = new THREE.ConeGeometry(8 + i * 3.5, 95, 12, 1, true);
+      const coneMat = new THREE.MeshBasicMaterial({
+        color: '#ffdf88',
+        transparent: true,
+        opacity: 0.045,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      godRayMats.push(coneMat);
+      const cone = new THREE.Mesh(coneGeo, coneMat);
+      cone.position.set((i - 2.5) * 4, -36, (i % 2 === 0 ? 1 : -1) * 3);
+      cone.rotation.z = (i - 2.5) * 0.08;
+      cone.rotation.x = 0.22;
+      godRaysGroup.add(cone);
+    }
+    sunMesh.add(godRaysGroup);
+
     celestialGroup.add(sunMesh, moonMesh);
     scene.add(celestialGroup);
+
+    // Dynamic Thunderstorm 3D Lightning Bolt Mesh
+    const lightningMat = new THREE.MeshBasicMaterial({
+      color: '#e0f7ff',
+      transparent: true,
+      opacity: 0,
+    });
+    const lightningMesh = new THREE.Mesh(new THREE.BoxGeometry(0.45, 70, 0.45), lightningMat);
+    lightningMesh.visible = false;
+    scene.add(lightningMesh);
 
     const cloudCount = 32;
     const cloudGeo = new THREE.BoxGeometry(12, 1.8, 8);
@@ -645,6 +848,15 @@ export default function App() {
     const mobs: PassiveMobModel[] = [];
     const villagers: VillagerMobModel[] = [];
     const hostileMobs: HostileMobModel[] = [];
+    const wolfPets: WolfPetModel[] = [];
+
+    const findSafeSpawnY = (wx: number, wz: number): number => {
+      let y = world.getTerrainHeight(wx, wz).height + 1;
+      while (y < 56 && (world.isSolidBlock(wx, y, wz) || world.isSolidBlock(wx, y + 1, wz))) {
+        y++;
+      }
+      return y;
+    };
 
     const spawnMobsAndVillagers = () => {
       for (const m of mobs) scene.remove(m.group);
@@ -652,13 +864,13 @@ export default function App() {
       const mobCoords = [
         [-6, -5, 'sheep'],
         [7, -4, 'pig'],
-        [-5, 7, 'sheep'],
-        [8, 6, 'pig'],
-        [12, -9, 'sheep'],
+        [-5, 7, 'cow'],
+        [8, 6, 'sheep'],
+        [12, -9, 'cow'],
         [-11, 9, 'pig'],
       ] as const;
       for (const [mx, mz, mtype] of mobCoords) {
-        const my = world.getTerrainHeight(mx, mz).height + 1;
+        const my = findSafeSpawnY(mx, mz);
         if (my > WATER_LEVEL + 1) {
           const mob = new PassiveMobModel(mtype, mx + 0.5, my, mz + 0.5);
           scene.add(mob.group);
@@ -666,19 +878,19 @@ export default function App() {
         }
       }
 
-      // Spawn Villagers in all 3 distant Villages
+      // Spawn Villagers in open courtyard positions around all 3 distant Villages
       for (const v of villagers) scene.remove(v.group);
       villagers.length = 0;
       const villagerProfessions = [
-        { role: 'Житель-Кузнец', color: '#4a3525', dx: 3, dz: 2 },
-        { role: 'Житель-Фермер', color: '#7c5832', dx: -3, dz: 3 },
-        { role: 'Житель-Торговец', color: '#2b5b84', dx: 2, dz: -3 },
+        { role: 'Житель-Кузнец', color: '#4a3525', dx: 4, dz: 0 },
+        { role: 'Житель-Фермер', color: '#7c5832', dx: -2, dz: 4 },
+        { role: 'Житель-Торговец', color: '#2b5b84', dx: 0, dz: -4 },
       ];
       for (const vc of VoxelWorld.VILLAGE_CENTERS) {
         for (const prof of villagerProfessions) {
           const vx = vc.x + prof.dx;
           const vz = vc.z + prof.dz;
-          const vy = world.getTerrainHeight(vx, vz).height + 1;
+          const vy = findSafeSpawnY(vx, vz);
           const villager = new VillagerMobModel(
             `${prof.role} (${vc.nameRu.split(' ')[0]})`,
             prof.color,
@@ -690,6 +902,23 @@ export default function App() {
           villagers.push(villager);
         }
       }
+
+      // Spawn 2 Tamed Wolf Companions (Рекс & Альфа) next to the player
+      for (const wp of wolfPets) scene.remove(wp.group);
+      wolfPets.length = 0;
+      const petConfigs = [
+        { name: 'Волк Рекс', collar: '#e53935', dx: 2, dz: -2 },
+        { name: 'Волк Альфа', collar: '#00acc1', dx: -2, dz: -2 },
+      ];
+      for (const pc of petConfigs) {
+        const wx = Math.floor(playerPosRef.current.x) + pc.dx;
+        const wz = Math.floor(playerPosRef.current.z) + pc.dz;
+        const wy = findSafeSpawnY(wx, wz);
+        const wolf = new WolfPetModel(pc.name, pc.collar, wx + 0.5, wy, wz + 0.5);
+        scene.add(wolf.group);
+        wolfPets.push(wolf);
+      }
+      setPetCount(wolfPets.length);
     };
     spawnMobsAndVillagers();
 
@@ -717,17 +946,94 @@ export default function App() {
       }
     };
 
-    // Spawn a Treasure Chest or Meteor Event in the world
-    const spawnWorldQuestEvent = (eventType: 'treasure' | 'meteor' = 'treasure', announce = true) => {
+    let bloodMoonTimer = 0;
+
+    // Expand event system: Treasure Hunt, Meteor Shower, Blood Moon, Wandering Trader, Boss Raid, Supply Drop
+    const spawnWorldQuestEvent = (
+      eventType: 'treasure' | 'meteor' | 'blood_moon' | 'trader' | 'boss' | 'airdrop' = 'treasure',
+      announce = true
+    ) => {
       const angle = Math.random() * Math.PI * 2;
-      const dist = 26 + Math.floor(Math.random() * 30);
+      const dist = 22 + Math.floor(Math.random() * 26);
       const qx = Math.round(playerPosRef.current.x + Math.cos(angle) * dist);
       const qz = Math.round(playerPosRef.current.z + Math.sin(angle) * dist);
       world.updateChunksAroundPlayer(qx, qz, 1);
       const qy = Math.max(world.getTerrainHeight(qx, qz).height + 1, WATER_LEVEL + 1);
 
-      if (eventType === 'meteor') {
-        // Build a glowing meteorite crater with gold/diamond ore & treasure chest
+      if (eventType === 'blood_moon') {
+        bloodMoonTimer = 65.0; // 65 seconds of Blood Moon
+        soundEngine.playExplosion();
+        // Spawn an immediate wave of 8-12 hostile mobs around player
+        for (let i = 0; i < 10; i++) {
+          const ma = (i / 10) * Math.PI * 2;
+          const md = 15 + Math.random() * 12;
+          const mx = Math.floor(playerPosRef.current.x + Math.cos(ma) * md);
+          const mz = Math.floor(playerPosRef.current.z + Math.sin(ma) * md);
+          const my = findSafeSpawnY(mx, mz);
+          if (my > WATER_LEVEL + 1) {
+            const kinds: HostileMobKind[] = ['zombie', 'skeleton', 'creeper', 'enderman', 'spider'];
+            const kind = kinds[i % kinds.length];
+            const hm = new HostileMobModel(kind, mx + 0.5, my, mz + 0.5);
+            hm.provokedTimer = 30.0;
+            scene.add(hm.group);
+            hostileMobs.push(hm);
+          }
+        }
+        setHostileCount(hostileMobs.length);
+        if (announce) {
+          setEventBanner('🌕 ИВЕНТ «КРОВАВАЯ ЛУНА»: Нашествие полчищ монстров! Спавн и урон x2 на 65 сек!');
+          setTimeout(() => setEventBanner(null), 6000);
+        }
+        return;
+      }
+
+      if (eventType === 'trader') {
+        const tx = Math.floor(playerPosRef.current.x) + 3;
+        const tz = Math.floor(playerPosRef.current.z) + 3;
+        const ty = findSafeSpawnY(tx, tz);
+        const trader = new VillagerMobModel('Бродячий Торговец (Скидки!)', '#1e3a8a', tx + 0.5, ty, tz + 0.5);
+        scene.add(trader.group);
+        villagers.push(trader);
+        soundEngine.playMagicChime();
+        addBlockToInventory(BlockId.EMERALD_BLOCK, 4);
+        addBlockToInventory(BlockId.DIAMOND_ORE, 2);
+        if (announce) {
+          setEventBanner('🛒 ИВЕНТ «БРОДЯЧИЙ ТОРГОВЕЦ»: Прибыл странствующий торговец и подарил +4 Изумрудных блока!');
+          setTimeout(() => setEventBanner(null), 5500);
+        }
+        return;
+      }
+
+      if (eventType === 'boss') {
+        soundEngine.playThunder();
+        // Spawn 2 empowered Endermen Bosses
+        for (let i = 0; i < 2; i++) {
+          const bx = Math.floor(playerPosRef.current.x) + (i === 0 ? 12 : -12);
+          const bz = Math.floor(playerPosRef.current.z) + (i === 0 ? 12 : -12);
+          const by = findSafeSpawnY(bx, bz);
+          const boss = new HostileMobModel('enderman', bx + 0.5, by, bz + 0.5);
+          boss.health = 10;
+          boss.maxHealth = 10;
+          boss.provokedTimer = 45.0;
+          scene.add(boss.group);
+          hostileMobs.push(boss);
+        }
+        setHostileCount(hostileMobs.length);
+        if (announce) {
+          setEventBanner('👹 ИВЕНТ «НАШЕСТВИЕ БОССОВ»: Древние Боссы вышли из тьмы! Уничтожьте их за редкую руду!');
+          setTimeout(() => setEventBanner(null), 6000);
+        }
+        return;
+      }
+
+      if (eventType === 'airdrop') {
+        world.setBlock(qx, qy - 1, qz, BlockId.GOLD_BLOCK, false);
+        world.setBlock(qx, qy, qz, BlockId.TREASURE_CHEST, true);
+        world.setBlock(qx, qy + 1, qz, BlockId.GLOWSTONE, false);
+        world.setBlock(qx, qy + 2, qz, BlockId.GLOWSTONE, false);
+        soundEngine.playExplosion();
+        spawnBlockParticles(qx, qy, qz, 30, 0x38bdf8);
+      } else if (eventType === 'meteor') {
         for (let dx = -1; dx <= 1; dx++) {
           for (let dz = -1; dz <= 1; dz++) {
             world.setBlock(qx + dx, qy - 1, qz + dz, BlockId.COBBLESTONE, false);
@@ -735,10 +1041,11 @@ export default function App() {
         }
         world.setBlock(qx + 1, qy, qz, BlockId.GOLD_ORE, false);
         world.setBlock(qx - 1, qy, qz, BlockId.DIAMOND_ORE, false);
-        world.setBlock(qx, qy + 1, qz, BlockId.GLOWSTONE, false);
+        world.setBlock(qx, qy + 1, qz, BlockId.LAVA, false);
         world.setBlock(qx, qy, qz, BlockId.TREASURE_CHEST, true);
+        soundEngine.playExplosion();
+        spawnBlockParticles(qx, qy, qz, 35, 0xff8800);
       } else {
-        // Place Treasure Chest on a Gold/Brick pedestal with a Glowstone beacon
         world.setBlock(qx, qy - 1, qz, BlockId.GOLD_BLOCK, false);
         world.setBlock(qx, qy + 2, qz, BlockId.GLOWSTONE, false);
         world.setBlock(qx, qy, qz, BlockId.TREASURE_CHEST, true);
@@ -746,8 +1053,13 @@ export default function App() {
 
       const nextQuest: WorldEventQuest = {
         id: `q_${Date.now()}`,
-        type: eventType,
-        title: eventType === 'meteor' ? 'Звёздный метеорит' : 'Поиск древнего клада',
+        type: eventType === 'meteor' ? 'meteor' : 'treasure',
+        title:
+          eventType === 'airdrop'
+            ? 'Падение припасов'
+            : eventType === 'meteor'
+            ? 'Звёздный метеорит'
+            : 'Поиск древнего клада',
         x: qx,
         y: qy,
         z: qz,
@@ -758,11 +1070,13 @@ export default function App() {
 
       if (announce) {
         const msg =
-          eventType === 'meteor'
-            ? `☄️ Ивент «Звёздный метеорит» упал на координатах X:${qx} Z:${qz}!`
-            : `🗺️ Ивент «Поиск клада»: сундук спрятан на X:${qx} Z:${qz}!`;
+          eventType === 'airdrop'
+            ? `📦 ИВЕНТ «ПАДЕНИЕ ПРИПАСОВ»: Груз сокровищ сброшен на X:${qx} Z:${qz}!`
+            : eventType === 'meteor'
+            ? `☄️ ИВЕНТ «ЗВЁЗДНЫЙ МЕТЕОРИТ»: Упал космический метеорит на X:${qx} Z:${qz}!`
+            : `🗺️ ИВЕНТ «ПОИСК КЛАДА»: Сокровища спрятаны на X:${qx} Z:${qz}!`;
         setEventBanner(msg);
-        setTimeout(() => setEventBanner(null), 5000);
+        setTimeout(() => setEventBanner(null), 5500);
       }
     };
 
@@ -777,20 +1091,20 @@ export default function App() {
       setActiveQuest((prev) => ({ ...prev, x: initX, y: initY, z: initZ }));
     }
 
-    const weatherCount = 240;
+    const weatherCount = 280;
     const weatherGeo = new THREE.BufferGeometry();
     const weatherPositions = new Float32Array(weatherCount * 3);
     for (let i = 0; i < weatherCount; i++) {
-      weatherPositions[i * 3] = (Math.random() - 0.5) * 32;
+      weatherPositions[i * 3] = (Math.random() - 0.5) * 34;
       weatherPositions[i * 3 + 1] = Math.random() * 24;
-      weatherPositions[i * 3 + 2] = (Math.random() - 0.5) * 32;
+      weatherPositions[i * 3 + 2] = (Math.random() - 0.5) * 34;
     }
     weatherGeo.setAttribute('position', new THREE.BufferAttribute(weatherPositions, 3));
     const weatherMat = new THREE.PointsMaterial({
       color: 0xaaccff,
       size: 0.18,
       transparent: true,
-      opacity: 0.75,
+      opacity: 0.78,
     });
     const weatherPoints = new THREE.Points(weatherGeo, weatherMat);
     weatherPoints.visible = false;
@@ -1081,7 +1395,6 @@ export default function App() {
       );
 
       setActiveQuest((prev) => ({ ...prev, foundCount: prev.foundCount + 1 }));
-      // Spawn next treasure quest automatically
       setTimeout(() => {
         spawnWorldQuestEvent(Math.random() > 0.4 ? 'treasure' : 'meteor', true);
       }, 1500);
@@ -1094,7 +1407,6 @@ export default function App() {
       world.setBlock(dx, dy, dz, targetId, true);
       netManager.sendBlockUpdate(dx, dy, dz, targetId);
 
-      // Toggle upper or lower half of the 2-block-tall door automatically
       const aboveId = world.getBlock(dx, dy + 1, dz);
       if (aboveId === BlockId.DOOR_CLOSED || aboveId === BlockId.DOOR_OPEN) {
         world.setBlock(dx, dy + 1, dz, targetId, true);
@@ -1109,7 +1421,7 @@ export default function App() {
 
     let handSwingAnim = 0;
 
-    // Attack hostile mobs or trade with villagers on left/right click
+    // Attack hostile mobs on left click (supports Sharpness III enchantment for 2x damage!)
     const tryAttackHostileMob = (): boolean => {
       const eyeOrigin = new THREE.Vector3(
         playerPosRef.current.x,
@@ -1119,7 +1431,7 @@ export default function App() {
       camera.getWorldDirection(_rayDir);
 
       let closestIdx = -1;
-      let closestDist = 4.3;
+      let closestDist = 4.4;
 
       for (let i = 0; i < hostileMobs.length; i++) {
         const hm = hostileMobs[i];
@@ -1143,10 +1455,11 @@ export default function App() {
           targetMob.position.x,
           targetMob.position.y + 1.0,
           targetMob.position.z,
-          10,
-          0xcc2222
+          12,
+          stateRef.current.enchantments.sharpness ? 0xbb66ff : 0xcc2222
         );
-        const died = targetMob.takeDamage(1, _rayDir);
+        const hitDmg = stateRef.current.enchantments.sharpness ? 2 : 1;
+        const died = targetMob.takeDamage(hitDmg, _rayDir, world);
         if (died) {
           scene.remove(targetMob.group);
           hostileMobs.splice(closestIdx, 1);
@@ -1162,7 +1475,19 @@ export default function App() {
       return false;
     };
 
-    const tryInteractWithVillager = (): boolean => {
+    const tryInteractWithVillagerOrPet = (): boolean => {
+      // Check Tamed Wolf Pets first
+      for (const wp of wolfPets) {
+        if (wp.position.distanceTo(playerPosRef.current) <= 3.6) {
+          soundEngine.playWolfBark();
+          setHealth((h) => Math.min(20, h + 4));
+          addBlockToInventory(BlockId.DIAMOND_ORE, 1);
+          setEventBanner(`🐕 ${wp.petName} радостно виляет хвостом и принёс вам +1 Алмазную руду!`);
+          setTimeout(() => setEventBanner(null), 3500);
+          return true;
+        }
+      }
+      // Check Villagers
       for (const v of villagers) {
         const dist = v.position.distanceTo(playerPosRef.current);
         if (dist <= 4.2) {
@@ -1196,7 +1521,8 @@ export default function App() {
           : blockId === BlockId.DOOR_OPEN
           ? BlockId.DOOR_CLOSED
           : blockId;
-      addBlockToInventory(dropId, 1);
+      const dropMult = stateRef.current.enchantments.fortune ? 2 : 1;
+      addBlockToInventory(dropId, dropMult);
       netManager.sendBlockUpdate(bx, by, bz, BlockId.AIR);
     };
 
@@ -1204,8 +1530,7 @@ export default function App() {
       handSwingAnim = 0.26;
       localPlayerModel.triggerSwing();
 
-      // Check villager interaction first if close
-      if (tryInteractWithVillager()) return;
+      if (tryInteractWithVillagerOrPet()) return;
 
       const eyeOrigin = new THREE.Vector3(
         playerPosRef.current.x,
@@ -1230,12 +1555,19 @@ export default function App() {
         return;
       }
 
-      if (hit.blockId === BlockId.CRAFTING_TABLE && !keysRef.current['ShiftLeft']) {
-        soundEngine.playClick();
+      // Open Workshop / Enchanting Table / Brewing Stand UI on right-click!
+      if (
+        (hit.blockId === BlockId.CRAFTING_TABLE ||
+          hit.blockId === BlockId.ENCHANTING_TABLE ||
+          hit.blockId === BlockId.BREWING_STAND) &&
+        !keysRef.current['ShiftLeft']
+      ) {
+        soundEngine.playMagicChime();
         setShowInventory(true);
         if (document.pointerLockElement) document.exitPointerLock();
         return;
       }
+
       if (hit.blockId === BlockId.TNT && !keysRef.current['ShiftLeft']) {
         detonateTNT(hx, hy, hz);
         return;
@@ -1271,7 +1603,6 @@ export default function App() {
       world.setBlock(px, py, pz, slot.blockId, true);
       soundEngine.playBlockPlace();
 
-      // If placing a door, also place upper half if air
       if (slot.blockId === BlockId.DOOR_CLOSED && world.getBlock(px, py + 1, pz) === BlockId.AIR) {
         world.setBlock(px, py + 1, pz, BlockId.DOOR_CLOSED, true);
         netManager.sendBlockUpdate(px, py + 1, pz, BlockId.DOOR_CLOSED);
@@ -1385,6 +1716,8 @@ export default function App() {
         setGameMode((m) => (m === 'survival' ? 'creative' : 'survival'));
       } else if (e.code === 'KeyM') {
         setShowMiniMap((m) => !m);
+      } else if (e.code === 'KeyG') {
+        setNextGenShaders((s) => !s);
       }
     };
 
@@ -1446,6 +1779,9 @@ export default function App() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      if (composer) {
+        composer.setSize(window.innerWidth, window.innerHeight);
+      }
     };
 
     document.addEventListener('pointerlockchange', onPointerLockChange);
@@ -1496,7 +1832,6 @@ export default function App() {
       ctx.fillStyle = '#101820';
       ctx.fillRect(0, 0, W, H);
 
-      // Sample terrain grid around player (radius 48 blocks, step 3 blocks)
       const range = 48;
       const step = 3;
       const scale = halfW / range;
@@ -1523,7 +1858,6 @@ export default function App() {
         }
       }
 
-      // Helper to project world coords onto radar (clamped to border if far away)
       const projectPoint = (wx: number, wz: number) => {
         const dx = (wx - px) * scale;
         const dz = (wz - pz) * scale;
@@ -1536,7 +1870,7 @@ export default function App() {
         return { x: halfW + dx, y: halfH + dz, clamped: false };
       };
 
-      // 1. Draw Villages (Emerald House icons)
+      // 1. Draw Villages (Emerald circles)
       for (const vc of VoxelWorld.VILLAGE_CENTERS) {
         const pt = projectPoint(vc.x, vc.z);
         ctx.fillStyle = '#10b981';
@@ -1548,7 +1882,17 @@ export default function App() {
         ctx.stroke();
       }
 
-      // 2. Draw World Spawn (0, 0) Star/Cross
+      // 2. Draw Underground Dungeons (Purple diamond markers)
+      for (const dl of VoxelWorld.DUNGEON_LOCATIONS) {
+        const pt = projectPoint(dl.x, dl.z);
+        ctx.fillStyle = '#c084fc';
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1.5;
+        ctx.fillRect(pt.x - 4, pt.y - 4, 8, 8);
+        ctx.strokeRect(pt.x - 4, pt.y - 4, 8, 8);
+      }
+
+      // 3. Draw World Spawn (0, 0)
       const spawnPt = projectPoint(0, 0);
       ctx.fillStyle = '#38bdf8';
       ctx.strokeStyle = '#000000';
@@ -1556,7 +1900,7 @@ export default function App() {
       ctx.fillRect(spawnPt.x - 4, spawnPt.y - 4, 8, 8);
       ctx.strokeRect(spawnPt.x - 4, spawnPt.y - 4, 8, 8);
 
-      // 3. Draw Active Treasure Hunt / Meteor Quest (Gold X)
+      // 4. Draw Active Treasure Hunt / Meteor Quest (Gold X)
       const q = stateRef.current.activeQuest;
       const questPt = projectPoint(q.x, q.z);
       ctx.strokeStyle = '#fbbf24';
@@ -1568,7 +1912,14 @@ export default function App() {
       ctx.lineTo(questPt.x - 5, questPt.y + 5);
       ctx.stroke();
 
-      // 4. Draw Hostile Mobs (Red dots)
+      // 5. Draw Tamed Wolf Pets (Lime green dots)
+      ctx.fillStyle = '#a3e635';
+      for (const wp of wolfPets) {
+        const pt = projectPoint(wp.position.x, wp.position.z);
+        ctx.fillRect(pt.x - 2.5, pt.y - 2.5, 5, 5);
+      }
+
+      // 6. Draw Hostile Mobs (Red dots)
       ctx.fillStyle = '#ef4444';
       for (const hm of hostileMobs) {
         const pt = projectPoint(hm.position.x, hm.position.z);
@@ -1577,7 +1928,7 @@ export default function App() {
         }
       }
 
-      // 5. Draw Remote Online Players (Cyan dots)
+      // 7. Draw Remote Online Players (Cyan dots)
       ctx.fillStyle = '#22d3ee';
       for (const [, rm] of remoteModels.entries()) {
         const pt = projectPoint(rm.group.position.x, rm.group.position.z);
@@ -1586,14 +1937,12 @@ export default function App() {
         ctx.fill();
       }
 
-      // 6. Draw Local Player & View Direction Cone at center
+      // 8. Draw Local Player & View Direction Cone at center
       ctx.save();
       ctx.translate(halfW, halfH);
-      // Player look direction in world: (-sin(yaw), -cos(yaw))
       const angle = Math.atan2(-Math.cos(yawRef.current), -Math.sin(yawRef.current));
       ctx.rotate(angle);
 
-      // View cone
       ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
       ctx.beginPath();
       ctx.moveTo(0, 0);
@@ -1601,7 +1950,6 @@ export default function App() {
       ctx.closePath();
       ctx.fill();
 
-      // Player arrow
       ctx.fillStyle = '#ffffff';
       ctx.strokeStyle = '#000000';
       ctx.lineWidth = 1.5;
@@ -1615,7 +1963,6 @@ export default function App() {
       ctx.stroke();
       ctx.restore();
 
-      // Cardinal letters N/S/W/E
       ctx.font = 'bold 10px monospace';
       ctx.fillStyle = '#f87171';
       ctx.textAlign = 'center';
@@ -1635,11 +1982,20 @@ export default function App() {
     let uiCoordAccum = 0;
     let walkBobTimer = 0;
     let hostileSpawnAccum = 0;
+    let potionTickAccum = 0;
+    let lightningCooldown = 6 + Math.random() * 7;
+    let lightningFlashTimer = 0;
+
+    let autoEventAccum = 20; // Trigger first event 20s after world start
 
     function tick() {
       const delta = Math.min(clock.getDelta(), 0.1);
       const elapsed = clock.getElapsedTime();
       const st = stateRef.current;
+
+      // Update Swaying Foliage & Water Ripple Shader Uniforms
+      world.shaderUniforms.uTime.value = elapsed;
+      world.shaderUniforms.uSwayEnabled.value = st.nextGenShaders ? 1.0 : 0.0;
 
       // Update local player overhead nickname if changed
       localPlayerModel.setName(st.playerName, isTouch ? 'mobile' : 'desktop');
@@ -1650,31 +2006,87 @@ export default function App() {
         st.timeOfDay = nextTime;
       }
 
-      const isNight = st.timeOfDay >= 0.55 || st.timeOfDay <= 0.05;
-
-      // Nighttime Hostile Mob Spawning & Daytime Burn
-      hostileSpawnAccum += delta;
-      if (hostileSpawnAccum > 3.5) {
-        hostileSpawnAccum = 0;
-        if (isNight && hostileMobs.length < 9 && !st.inTitleScreen) {
-          const angle = Math.random() * Math.PI * 2;
-          const dist = 12 + Math.random() * 14;
-          const mx = Math.floor(playerPosRef.current.x + Math.cos(angle) * dist);
-          const mz = Math.floor(playerPosRef.current.z + Math.sin(angle) * dist);
-          const my = world.getTerrainHeight(mx, mz).height + 1;
-          if (my > WATER_LEVEL + 1) {
-            const kind = Math.random() > 0.4 ? 'zombie' : 'creeper';
-            const hm = new HostileMobModel(kind, mx + 0.5, my, mz + 0.5);
-            scene.add(hm.group);
-            hostileMobs.push(hm);
-            setHostileCount(hostileMobs.length);
+      // Tick active alchemical potions (1 second interval)
+      potionTickAccum += delta;
+      if (potionTickAccum >= 1.0) {
+        potionTickAccum = 0;
+        const curP = st.potions;
+        if (curP.speed > 0 || curP.nightVision > 0 || curP.regen > 0) {
+          const nextP = {
+            speed: Math.max(0, curP.speed - 1),
+            nightVision: Math.max(0, curP.nightVision - 1),
+            regen: Math.max(0, curP.regen - 1),
+          };
+          st.potions = nextP;
+          setPotions(nextP);
+          if (nextP.regen > 0 && st.health < 20) {
+            setHealth((h) => Math.min(20, h + 1));
           }
-        } else if (!isNight && hostileMobs.length > 2) {
-          // Daylight despawns excess night monsters
-          const burned = hostileMobs.pop();
-          if (burned) {
-            spawnBlockParticles(burned.position.x, burned.position.y + 1, burned.position.z, 8, 0xff8800);
-            scene.remove(burned.group);
+        }
+      }
+
+      // Automated Dynamic World Events Scheduler (triggers every 90-110 seconds)
+      autoEventAccum += delta;
+      if (autoEventAccum > 95) {
+        autoEventAccum = 0;
+        if (!st.inTitleScreen) {
+          const autoEvList = ['blood_moon', 'meteor', 'trader', 'boss', 'airdrop', 'treasure'] as const;
+          const pickedEv = autoEvList[Math.floor(Math.random() * autoEvList.length)];
+          spawnWorldQuestEvent(pickedEv, true);
+        }
+      }
+
+      if (bloodMoonTimer > 0) {
+        bloodMoonTimer = Math.max(0, bloodMoonTimer - delta);
+      }
+
+      const isNight = st.timeOfDay >= 0.55 || st.timeOfDay <= 0.05 || bloodMoonTimer > 0;
+
+      // Nighttime Hostile Mob Spawning & Daytime Sunlight Burn & Despawn
+      hostileSpawnAccum += delta;
+      const spawnFreq = bloodMoonTimer > 0 ? 1.0 : isNight ? 2.0 : 4.0;
+
+      if (hostileSpawnAccum > spawnFreq) {
+        hostileSpawnAccum = 0;
+        const maxMobs = bloodMoonTimer > 0 ? 22 : isNight || st.weather === 'storm' ? 14 : 0;
+
+        if (
+          hostileMobs.length < maxMobs &&
+          !st.inTitleScreen &&
+          (isNight || st.weather === 'storm' || bloodMoonTimer > 0)
+        ) {
+          // Spawn a wave of 1 to 3 hostile mobs in a ring around the player (16-34 blocks)
+          const waveCount = bloodMoonTimer > 0 ? 3 : Math.floor(1 + Math.random() * 2);
+          for (let w = 0; w < waveCount && hostileMobs.length < maxMobs; w++) {
+            const angle = Math.random() * Math.PI * 2;
+            const dist = 16 + Math.random() * 18;
+            const mx = Math.floor(playerPosRef.current.x + Math.cos(angle) * dist);
+            const mz = Math.floor(playerPosRef.current.z + Math.sin(angle) * dist);
+            const my = findSafeSpawnY(mx, mz);
+            if (my > WATER_LEVEL + 1) {
+              const kinds: HostileMobKind[] = ['zombie', 'creeper', 'skeleton', 'enderman', 'spider'];
+              const kind = kinds[Math.floor(Math.random() * kinds.length)];
+              const hm = new HostileMobModel(kind, mx + 0.5, my, mz + 0.5);
+              if (bloodMoonTimer > 0) hm.provokedTimer = 30.0;
+              scene.add(hm.group);
+              hostileMobs.push(hm);
+            }
+          }
+          setHostileCount(hostileMobs.length);
+        } else if (!isNight && st.weather !== 'storm' && bloodMoonTimer <= 0 && hostileMobs.length > 0) {
+          // Daybreak: All surface hostile mobs burn in daylight with flame particles and despawn!
+          let burnedAny = false;
+          for (let i = hostileMobs.length - 1; i >= 0; i--) {
+            const hm = hostileMobs[i];
+            if (hm.position.y >= WATER_LEVEL) {
+              spawnBlockParticles(hm.position.x, hm.position.y + 0.9, hm.position.z, 14, 0xff5500);
+              scene.remove(hm.group);
+              hostileMobs.splice(i, 1);
+              burnedAny = true;
+            }
+          }
+          if (burnedAny) {
+            soundEngine.playBlockBreak();
             setHostileCount(hostileMobs.length);
           }
         }
@@ -1699,29 +2111,108 @@ export default function App() {
       sunLight.target.position.copy(playerPosRef.current);
       sunLight.target.updateMatrixWorld();
 
-      if (sunY > 0.2) {
-        _curSky.copy(_skyDay);
-        sunLight.intensity = 1.15;
-        hemiLight.intensity = 0.8;
-      } else if (sunY > -0.15) {
-        const t = (sunY + 0.15) / 0.35;
-        _curSky.lerpColors(_skySunset, _skyDay, t);
-        sunLight.intensity = 0.45 + t * 0.7;
-        hemiLight.intensity = 0.45 + t * 0.35;
+      // Calculate Sunset / Dawn factor for Volumetric God Rays & Dynamic Color Grading
+      let sunsetFactor = 0;
+      if (bloodMoonTimer > 0) {
+        _curSky.set('#5d0000');
+        sunLight.color.set('#ff4444');
+        hemiLight.color.set('#cc2222');
+        sunLight.intensity = 1.35;
+        hemiLight.intensity = 0.9;
+        sunsetFactor = 0.8;
       } else {
-        const t = Math.min(1, (-sunY - 0.15) / 0.3);
-        _curSky.lerpColors(_skySunset, _skyNight, t);
-        sunLight.intensity = 0.22;
-        hemiLight.intensity = 0.32;
+        sunLight.color.set('#fff8e7');
+        hemiLight.color.set('#d6e8ff');
+        if (sunY > 0.25) {
+          _curSky.copy(_skyDay);
+          sunLight.intensity = 1.18;
+          hemiLight.intensity = 0.82;
+          sunsetFactor = Math.max(0, 1 - (sunY - 0.25) * 2.2) * 0.45;
+        } else if (sunY > -0.16) {
+          const t = (sunY + 0.16) / 0.41;
+          _curSky.lerpColors(_skySunset, _skyDay, t);
+          sunLight.intensity = 0.5 + t * 0.68;
+          hemiLight.intensity = 0.48 + t * 0.34;
+          sunsetFactor = 1.0 - Math.abs(t - 0.45) * 1.4;
+        } else {
+          const t = Math.min(1, (-sunY - 0.16) / 0.3);
+          _curSky.lerpColors(_skySunset, _skyNight, t);
+          sunLight.intensity = 0.22;
+          hemiLight.intensity = 0.32;
+          sunsetFactor = Math.max(0, 1 - t * 2);
+        }
       }
 
-      if (st.weather !== 'clear') {
-        _curSky.lerp(new THREE.Color('#5a6978'), 0.45);
+      // Night Vision Potion Boost
+      if (st.potions.nightVision > 0) {
+        hemiLight.intensity = Math.max(hemiLight.intensity, 1.05);
+        sunLight.intensity = Math.max(sunLight.intensity, 0.85);
       }
 
+      // Update Volumetric God Rays visibility & intensity
+      if (st.nextGenShaders && sunY > -0.12 && st.weather === 'clear') {
+        godRaysGroup.visible = true;
+        godRaysGroup.lookAt(playerPosRef.current);
+        const rayAlpha = (0.032 + Math.max(0, sunsetFactor) * 0.055) * Math.min(1, (sunY + 0.12) * 3);
+        for (let i = 0; i < godRayMats.length; i++) {
+          godRayMats[i].opacity = rayAlpha * (0.75 + 0.25 * Math.sin(elapsed * 1.8 + i));
+          godRayMats[i].color.set(sunsetFactor > 0.35 ? '#ffb36b' : '#fff099');
+        }
+      } else {
+        godRaysGroup.visible = false;
+      }
+
+      // Dynamic Weather & Thunderstorm Lightning Strikes
+      if (st.weather === 'storm') {
+        _curSky.lerp(new THREE.Color('#232a38'), 0.72);
+        lightningCooldown -= delta;
+        if (lightningCooldown <= 0 && !st.inTitleScreen) {
+          lightningCooldown = 5 + Math.random() * 8;
+          lightningFlashTimer = 0.28;
+          const lx = playerPosRef.current.x + (Math.random() - 0.5) * 45;
+          const lz = playerPosRef.current.z + (Math.random() - 0.5) * 45;
+          lightningMesh.position.set(lx, playerPosRef.current.y + 20, lz);
+          lightningMesh.visible = true;
+          lightningMat.opacity = 0.95;
+          soundEngine.playThunder();
+        }
+      } else if (st.weather !== 'clear') {
+        _curSky.lerp(new THREE.Color('#5a6978'), 0.48);
+        lightningMesh.visible = false;
+      } else {
+        lightningMesh.visible = false;
+      }
+
+      if (lightningFlashTimer > 0) {
+        lightningFlashTimer = Math.max(0, lightningFlashTimer - delta);
+        _curSky.lerp(new THREE.Color('#e8f4ff'), lightningFlashTimer * 2.5);
+        sunLight.intensity += lightningFlashTimer * 6.0;
+        lightningMat.opacity = lightningFlashTimer * 3.2;
+        if (lightningFlashTimer <= 0.01) {
+          lightningMesh.visible = false;
+        }
+      }
+
+      // Volumetric Fog Density transitions (dawn/dusk mist, storm fog, underground cave atmosphere)
       (scene.background as THREE.Color).copy(_curSky);
       if (scene.fog instanceof THREE.FogExp2) {
         scene.fog.color.copy(_curSky);
+        const targetFogDensity =
+          st.potions.nightVision > 0
+            ? 0.008
+            : st.weather === 'storm'
+            ? 0.028
+            : st.weather !== 'clear'
+            ? 0.023
+            : 0.015 + Math.max(0, sunsetFactor) * 0.007;
+        scene.fog.density = THREE.MathUtils.lerp(scene.fog.density, targetFogDensity, delta * 3);
+      }
+
+      // Update Post-Processing Shader Uniforms
+      if (gradePass) {
+        gradePass.uniforms.uSunsetFactor.value = Math.max(0, sunsetFactor);
+        gradePass.uniforms.uNightVision.value = st.potions.nightVision > 0 ? 1.0 : 0.0;
+        gradePass.uniforms.uLightningFlash.value = lightningFlashTimer * 3.0;
       }
 
       for (let i = 0; i < cloudCount; i++) {
@@ -1772,8 +2263,9 @@ export default function App() {
           playerPosRef.current.z
         ) === BlockId.WATER;
 
-      let speed = isSprinting ? 6.8 : isSneaking ? 2.4 : 4.6;
-      if (st.isFlying) speed = isSprinting ? 14.0 : 9.0;
+      const speedPotionMult = st.potions.speed > 0 ? 1.65 : 1.0;
+      let speed = (isSprinting ? 6.8 : isSneaking ? 2.4 : 4.6) * speedPotionMult;
+      if (st.isFlying) speed = (isSprinting ? 14.0 : 9.0) * speedPotionMult;
       else if (inWater) speed *= 0.65;
 
       playerVelRef.current.x = wishDir.x * speed;
@@ -1921,7 +2413,10 @@ export default function App() {
             currentMiningTimer = 0;
           }
 
-          const breakDuration = st.gameMode === 'creative' ? 0.08 : (bDef?.hardness || 0.8) * 0.55;
+          // Efficiency III enchantment speeds up mining by 3x!
+          const effFactor = st.enchantments.efficiency ? 0.22 : 0.55;
+          const breakDuration =
+            st.gameMode === 'creative' ? 0.08 : (bDef?.hardness || 0.8) * effFactor;
           currentMiningTimer += delta;
 
           if (Math.floor(currentMiningTimer * 10) !== Math.floor((currentMiningTimer - delta) * 10)) {
@@ -1958,19 +2453,66 @@ export default function App() {
         model.update(delta, distSq > 0.002, false);
       }
 
-      const groundFn = (x: number, z: number) =>
-        world.getTerrainHeight(Math.floor(x), Math.floor(z)).height + 1;
-
       for (const mob of mobs) {
-        mob.update(delta, groundFn);
+        mob.update(delta, world);
       }
 
       for (const v of villagers) {
-        v.update(delta, playerPosRef.current, groundFn);
+        v.update(delta, playerPosRef.current, world);
+      }
+
+      // Update Tamed Wolf Pets (nighttime monster combat + daytime resource scavenging)
+      for (const wp of wolfPets) {
+        wp.update(
+          delta,
+          elapsed,
+          playerPosRef.current,
+          isNight,
+          hostileMobs,
+          world,
+          (mobIdx, targetMob) => {
+            soundEngine.playWolfBark();
+            spawnBlockParticles(
+              targetMob.position.x,
+              targetMob.position.y + 0.9,
+              targetMob.position.z,
+              8,
+              0xffaa00
+            );
+            const knockDir = new THREE.Vector3()
+              .subVectors(targetMob.position, wp.position)
+              .normalize();
+            const died = targetMob.takeDamage(1, knockDir, world);
+            if (died && hostileMobs[mobIdx] === targetMob) {
+              scene.remove(targetMob.group);
+              hostileMobs.splice(mobIdx, 1);
+              setHostileCount(hostileMobs.length);
+              soundEngine.playBlockBreak();
+              addBlockToInventory(BlockId.EMERALD_BLOCK, 1);
+              setEventBanner(`🐺 Питомец ${wp.petName} победил монстра и принёс +1 Изумрудный блок!`);
+              setTimeout(() => setEventBanner(null), 3200);
+            }
+          },
+          (petName) => {
+            if (!st.inTitleScreen) {
+              const gifts = [
+                { id: BlockId.IRON_ORE, label: 'Железную руду' },
+                { id: BlockId.GOLD_ORE, label: 'Золотую руду' },
+                { id: BlockId.DIAMOND_ORE, label: 'Алмазную руду' },
+                { id: BlockId.OAK_LOG, label: 'Дубовое бревно' },
+              ];
+              const gift = gifts[Math.floor(Math.random() * gifts.length)];
+              addBlockToInventory(gift.id, 2);
+              soundEngine.playWolfBark();
+              setEventBanner(`🐕 Питомец ${petName} нашёл и принёс вам ресурсы: +2 (${gift.label})!`);
+              setTimeout(() => setEventBanner(null), 3500);
+            }
+          }
+        );
       }
 
       for (const hm of hostileMobs) {
-        hm.update(delta, playerPosRef.current, groundFn, (dmg) => {
+        hm.update(delta, playerPosRef.current, world, (dmg) => {
           if (st.gameMode === 'survival' && !st.inTitleScreen) {
             soundEngine.playBlockHit(0.5);
             setHealth((h) => {
@@ -2002,11 +2544,26 @@ export default function App() {
         }
       }
 
-      if (st.weather !== 'clear') {
+      // Dynamic Weather & Automatic Snow in Snow/Mountain Biomes
+      const curBiome = world.getTerrainHeight(
+        Math.floor(playerPosRef.current.x),
+        Math.floor(playerPosRef.current.z)
+      ).biome;
+      const effectiveWeather =
+        st.weather !== 'clear' ? st.weather : curBiome === 'snow' ? 'snow' : 'clear';
+
+      if (effectiveWeather !== 'clear') {
         weatherPoints.visible = true;
-        weatherMat.color.set(st.weather === 'snow' ? 0xffffff : 0x77b5fe);
+        weatherMat.color.set(
+          effectiveWeather === 'snow'
+            ? 0xffffff
+            : effectiveWeather === 'storm'
+            ? 0x99ccff
+            : 0x77b5fe
+        );
         const posArr = weatherGeo.attributes.position.array as Float32Array;
-        const fallSpeed = st.weather === 'snow' ? 3.5 : 16.0;
+        const fallSpeed =
+          effectiveWeather === 'snow' ? 3.5 : effectiveWeather === 'storm' ? 22.0 : 16.0;
         for (let i = 0; i < weatherCount; i++) {
           posArr[i * 3 + 1] -= fallSpeed * delta;
           if (posArr[i * 3 + 1] < 0) {
@@ -2065,7 +2622,7 @@ export default function App() {
           x: bx,
           y: by,
           z: bz,
-          biome: biomeMap[bInfo.biome] || 'Равнины',
+          biome: by <= 13 ? 'Подземелье (Данж)' : biomeMap[bInfo.biome] || 'Равнины',
         });
         if (st.autoDayNight) {
           setTimeOfDay(st.timeOfDay);
@@ -2073,7 +2630,11 @@ export default function App() {
         drawMiniMap();
       }
 
-      renderer.render(scene, camera);
+      if (composer && st.nextGenShaders && !isSoftwareGl) {
+        composer.render();
+      } else {
+        renderer.render(scene, camera);
+      }
 
       if (isSoftwareGl) {
         afterDraw(tick);
@@ -2281,6 +2842,14 @@ export default function App() {
                 <span>Деревни (3)</span>
               </div>
               <div className="flex items-center gap-1">
+                <span className="w-2 h-2 bg-purple-400 inline-block" />
+                <span>Данжи (2)</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="w-2 h-2 bg-cyan-300 inline-block" />
+                <span>Волки ({petCount})</span>
+              </div>
+              <div className="flex items-center gap-1">
                 <span className="w-2 h-2 bg-amber-400 inline-block" />
                 <span>Клад ({distToQuest}м)</span>
               </div>
@@ -2290,21 +2859,28 @@ export default function App() {
               </div>
             </div>
 
-            {/* Quick Navigation & Village Teleport Buttons */}
+            {/* Quick Navigation & Village / Dungeon Teleport Buttons */}
             <div className="pt-1 border-t border-white/15 flex flex-wrap gap-1">
               <button
                 onClick={() => teleportPlayerTo(0, 0, 'Спавн мира')}
-                className="flex-1 px-1.5 py-1 bg-sky-900/70 hover:bg-sky-800 border border-sky-400/40 text-[10px] text-sky-200 cursor-pointer text-center"
+                className="flex-1 px-1 py-1 bg-sky-900/70 hover:bg-sky-800 border border-sky-400/40 text-[10px] text-sky-200 cursor-pointer text-center"
                 title="Вернуться на точку спавна (0, 0)"
               >
-                На Спавн
+                Спавн
               </button>
               <button
                 onClick={() => teleportPlayerTo(40, -34, 'Северная Деревня')}
-                className="flex-1 px-1.5 py-1 bg-emerald-900/70 hover:bg-emerald-800 border border-emerald-400/40 text-[10px] text-emerald-200 cursor-pointer text-center"
+                className="flex-1 px-1 py-1 bg-emerald-900/70 hover:bg-emerald-800 border border-emerald-400/40 text-[10px] text-emerald-200 cursor-pointer text-center"
                 title="Переместиться к Северной Деревне с жителями и домами"
               >
-                В Деревню
+                Деревня
+              </button>
+              <button
+                onClick={() => teleportPlayerTo(18, -18, 'Алмазное Подземелье', 9.2)}
+                className="flex-1 px-1 py-1 bg-purple-900/80 hover:bg-purple-800 border border-purple-400/50 text-[10px] text-purple-200 cursor-pointer text-center"
+                title="Спуститься в подземный Данж с алмазами, лавой и столом зачарований"
+              >
+                В Данж
               </button>
             </div>
           </div>
@@ -2319,7 +2895,7 @@ export default function App() {
         !showInventory &&
         !showChat && (
           <div className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-20 bg-black/80 border border-amber-400/40 px-4 py-1.5 text-xs text-amber-200 whitespace-nowrap">
-            Кликните по 3D-миру для игры (ПКМ по двери — открыть/закрыть, ПКМ по сундуку — забрать клад)
+            Кликните по 3D-миру для игры (ПКМ по двери/сундуку/столу чар · Волки защищают ночью и носят руду днём)
           </div>
         )}
 
@@ -2409,6 +2985,17 @@ export default function App() {
                 К цели
               </button>
             </div>
+            {/* Active Pet AI & Alchemy / Enchantment status badges */}
+            <div className="pt-1 border-t border-white/15 flex flex-wrap items-center justify-between gap-1 text-[10px]">
+              <span className="text-cyan-300">
+                🐾 Волки ({petCount}): {!isNightTime ? 'ищут руду' : 'защищают от мобов'}
+              </span>
+              {(potions.speed > 0 || potions.nightVision > 0 || potions.regen > 0) && (
+                <span className="px-1.5 py-0.5 bg-fuchsia-900/80 border border-fuchsia-400/40 text-fuchsia-200">
+                  🧪 Зелье активно
+                </span>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -2485,7 +3072,7 @@ export default function App() {
       <div
         className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center transition-transform duration-200"
         style={{
-          maxWidth: 'min(960px, 96vw)',
+          maxWidth: 'min(980px, 96vw)',
           transform: dockCollapsed ? 'translateY(calc(100% - 28px))' : 'translateY(0)',
         }}
       >
@@ -2544,6 +3131,8 @@ export default function App() {
               const isSelected = idx === activeSlot;
               const iconUrl = blockIcons[slot.blockId];
               const def = BLOCKS[slot.blockId];
+              const hasEnchant =
+                enchantments.efficiency || enchantments.sharpness || enchantments.fortune;
               return (
                 <button
                   key={idx}
@@ -2556,7 +3145,7 @@ export default function App() {
                     isSelected
                       ? 'bg-[#b5b5b5] border-2 border-white scale-105 z-10'
                       : 'mc-slot hover:bg-[#9c9c9c]'
-                  }`}
+                  } ${isSelected && hasEnchant ? 'ring-1 ring-fuchsia-400' : ''}`}
                 >
                   <span className="absolute top-0.5 left-1 text-[9px] font-mono-tabular text-neutral-300">
                     {idx + 1}
@@ -2585,7 +3174,7 @@ export default function App() {
                 setShowInventory((s) => !s);
               }}
               className="ml-1 w-11 h-11 sm:w-12 sm:h-12 mc-btn flex flex-col items-center justify-center text-white cursor-pointer"
-              title="Инвентарь и Верстак [E]"
+              title="Инвентарь, Зачарования и Зельеварение [E]"
             >
               <Package className="w-4 h-4" />
               <span className="text-[9px] font-mono-tabular mt-0.5">[E]</span>
@@ -2608,12 +3197,28 @@ export default function App() {
             <button
               onClick={() => {
                 soundEngine.playClick();
+                setNextGenShaders((s) => !s);
+              }}
+              className={`px-2.5 py-1 border flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                nextGenShaders
+                  ? 'bg-fuchsia-950/90 border-fuchsia-400 text-fuchsia-200'
+                  : 'bg-neutral-800 hover:bg-neutral-700 border-white/15 text-neutral-400'
+              }`}
+              title="Next-Gen Shaders: SSAO, God Rays, Bloom, Depth of Field и Swaying Foliage [G]"
+            >
+              <Sparkles className="w-3 h-3 text-fuchsia-400" />
+              <span>Шейдеры: {nextGenShaders ? 'ВКЛ' : 'ВЫКЛ'} [G]</span>
+            </button>
+
+            <button
+              onClick={() => {
+                soundEngine.playClick();
                 setGameMode((m) => (m === 'survival' ? 'creative' : 'survival'));
               }}
               className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-white/15 flex items-center gap-1 cursor-pointer whitespace-nowrap"
             >
-              <Sparkles className="w-3 h-3 text-amber-400" />
-              <span>Режим: {gameMode === 'survival' ? 'Выживание' : 'Креатив'} [C]</span>
+              <Hammer className="w-3 h-3 text-amber-400" />
+              <span>{gameMode === 'survival' ? 'Выживание' : 'Креатив'} [C]</span>
             </button>
 
             <button
@@ -2647,7 +3252,7 @@ export default function App() {
                 {cameraMode === 'first'
                   ? '1-е лицо'
                   : cameraMode === 'third-back'
-                  ? '3-е (виден ник)'
+                  ? '3-е (ник)'
                   : '3-е спереди'}{' '}
                 [V]
               </span>
@@ -2692,14 +3297,32 @@ export default function App() {
               onClick={() =>
                 updateWorldEnv(
                   timeOfDay,
-                  weather === 'clear' ? 'rain' : weather === 'rain' ? 'snow' : 'clear'
+                  weather === 'clear'
+                    ? 'rain'
+                    : weather === 'rain'
+                    ? 'storm'
+                    : weather === 'storm'
+                    ? 'snow'
+                    : 'clear'
                 )
               }
-              className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-white/15 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+              className={`px-2.5 py-1 border flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                weather === 'storm'
+                  ? 'bg-amber-950/90 border-amber-400 text-amber-200'
+                  : 'bg-neutral-800 hover:bg-neutral-700 border-white/15'
+              }`}
+              title="Сменить погоду: Ясно -> Дождь -> Гроза с молниями -> Снег"
             >
               <CloudRain className="w-3 h-3 text-sky-300" />
               <span>
-                Погода: {weather === 'clear' ? 'Ясно' : weather === 'rain' ? 'Дождь' : 'Снег'}
+                Погода:{' '}
+                {weather === 'clear'
+                  ? 'Ясно'
+                  : weather === 'rain'
+                  ? 'Дождь'
+                  : weather === 'storm'
+                  ? 'Гроза ⚡'
+                  : 'Снег'}
               </span>
             </button>
 
@@ -2722,15 +3345,15 @@ export default function App() {
         </div>
       </div>
 
-      {/* Inventory & Crafting Table Modal [E] */}
+      {/* Inventory, Crafting Table, Enchanting & Brewing Modal [E] */}
       {showInventory && (
         <div className="pointer-events-auto fixed inset-0 z-30 bg-black/75 flex items-center justify-center p-4">
-          <div className="mc-panel w-full max-w-3xl p-5 text-neutral-900 max-h-[90vh] overflow-y-auto">
+          <div className="mc-panel w-full max-w-4xl p-5 text-neutral-900 max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b-2 border-neutral-500 pb-3 mb-4">
               <div className="flex items-center gap-2">
                 <Hammer className="w-5 h-5 text-neutral-800" />
                 <h2 className="font-pixel text-sm text-neutral-900">
-                  ВЕРСТАК И КАТАЛОГ БЛОКОВ
+                  ВЕРСТАК, ЗАЧАРОВАНИЯ И ЗЕЛЬЕВАРЕНИЕ
                 </h2>
               </div>
               <button
@@ -2741,12 +3364,135 @@ export default function App() {
               </button>
             </div>
 
+            {/* Enchanting Table & Brewing Stand Section */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
+              {/* Enchanting Table */}
+              <div className="bg-[#3b2d4a] border-2 border-purple-400 p-3 text-white">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    {blockIcons[BlockId.ENCHANTING_TABLE] && (
+                      <img
+                        src={blockIcons[BlockId.ENCHANTING_TABLE]}
+                        alt="Enchanting"
+                        className="w-6 h-6 pixelated"
+                      />
+                    )}
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-purple-200">
+                      ✨ Стол Зачарований (Чары)
+                    </h3>
+                  </div>
+                  <span className="text-[10px] text-purple-300">Клик для активации</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                  <button
+                    onClick={() => handleToggleEnchantment('efficiency')}
+                    className={`p-2 text-left border cursor-pointer transition-colors ${
+                      enchantments.efficiency
+                        ? 'bg-purple-700 border-amber-300 text-white'
+                        : 'bg-black/40 border-purple-500/40 text-purple-200 hover:bg-purple-900/50'
+                    }`}
+                  >
+                    <div className="text-xs font-bold">Эффективность III</div>
+                    <div className="text-[10px] text-purple-200 mt-0.5">
+                      Ускоренная добыча блоков и руды
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => handleToggleEnchantment('sharpness')}
+                    className={`p-2 text-left border cursor-pointer transition-colors ${
+                      enchantments.sharpness
+                        ? 'bg-purple-700 border-amber-300 text-white'
+                        : 'bg-black/40 border-purple-500/40 text-purple-200 hover:bg-purple-900/50'
+                    }`}
+                  >
+                    <div className="text-xs font-bold">Острота III</div>
+                    <div className="text-[10px] text-purple-200 mt-0.5">
+                      Удвоенный урон по мобам (14 ед.)
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => handleToggleEnchantment('fortune')}
+                    className={`p-2 text-left border cursor-pointer transition-colors ${
+                      enchantments.fortune
+                        ? 'bg-purple-700 border-amber-300 text-white'
+                        : 'bg-black/40 border-purple-500/40 text-purple-200 hover:bg-purple-900/50'
+                    }`}
+                  >
+                    <div className="text-xs font-bold">Удача III</div>
+                    <div className="text-[10px] text-purple-200 mt-0.5">
+                      x2–x3 ресурсов с руды и мобов
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Brewing Stand (Alchemy) */}
+              <div className="bg-[#3d281e] border-2 border-amber-400 p-3 text-white">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    {blockIcons[BlockId.BREWING_STAND] && (
+                      <img
+                        src={blockIcons[BlockId.BREWING_STAND]}
+                        alt="Brewing"
+                        className="w-6 h-6 pixelated"
+                      />
+                    )}
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-amber-200">
+                      🧪 Варочная Стойка (Алхимия)
+                    </h3>
+                  </div>
+                  <span className="text-[10px] text-amber-300">Клик — выпить зелье</span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                  <button
+                    onClick={() => handleBrewPotion('speed')}
+                    className={`p-2 text-left border cursor-pointer transition-colors ${
+                      potions.speed > 0
+                        ? 'bg-sky-700 border-white text-white'
+                        : 'bg-black/40 border-amber-500/40 text-amber-100 hover:bg-amber-900/50'
+                    }`}
+                  >
+                    <div className="text-xs font-bold">Скорость II</div>
+                    <div className="text-[10px] text-amber-200 mt-0.5">
+                      +65% к скорости бега (120 сек)
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => handleBrewPotion('nightVision')}
+                    className={`p-2 text-left border cursor-pointer transition-colors ${
+                      potions.nightVision > 0
+                        ? 'bg-indigo-700 border-white text-white'
+                        : 'bg-black/40 border-amber-500/40 text-amber-100 hover:bg-amber-900/50'
+                    }`}
+                  >
+                    <div className="text-xs font-bold">Ночное Зрение</div>
+                    <div className="text-[10px] text-amber-200 mt-0.5">
+                      Яркое освещение ночью и в данжах
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => handleBrewPotion('regen')}
+                    className={`p-2 text-left border cursor-pointer transition-colors ${
+                      potions.regen > 0
+                        ? 'bg-rose-700 border-white text-white'
+                        : 'bg-black/40 border-amber-500/40 text-amber-100 hover:bg-amber-900/50'
+                    }`}
+                  >
+                    <div className="text-xs font-bold">Регенерация</div>
+                    <div className="text-[10px] text-amber-200 mt-0.5">
+                      Мгновенное лечение 20 HP и сытости
+                    </div>
+                  </button>
+                </div>
+              </div>
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div>
                 <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-700 mb-2">
                   Рецепты крафта (клик — создать блок)
                 </h3>
-                <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
                   {CRAFTING_RECIPES.map((recipe) => {
                     const outDef = BLOCKS[recipe.output.blockId];
                     const outIcon = blockIcons[recipe.output.blockId];
@@ -2790,7 +3536,7 @@ export default function App() {
                 <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-700 mb-2">
                   Все блоки игры (клик — добавить в слот #{activeSlot + 1})
                 </h3>
-                <div className="grid grid-cols-5 sm:grid-cols-6 gap-1.5 max-h-72 overflow-y-auto p-1">
+                <div className="grid grid-cols-5 sm:grid-cols-6 gap-1.5 max-h-64 overflow-y-auto p-1">
                   {PLACEABLE_BLOCKS.map((bid) => {
                     const def = BLOCKS[bid];
                     const icon = blockIcons[bid];
@@ -2972,19 +3718,19 @@ export default function App() {
 
               {/* New Features Summary Box */}
               <div className="bg-[#a8a8a8] border border-neutral-600 p-3 text-xs space-y-1 text-neutral-900">
-                <div className="font-bold">Что нового в мире:</div>
+                <div className="font-bold">Графика нового поколения и обновления геймплея:</div>
                 <ul className="list-disc list-inside space-y-0.5 text-[11px]">
                   <li>
-                    <b>Деревни и жители:</b> 3 деревни вокруг спавна с домами, открывающимися дверями (ПКМ) и жителями-торговцами.
+                    <b>Next-Gen Shaders [G]:</b> Мягкие тени SSAO в углах блоков, солнечные лучи (God Rays), колыхание листвы и воды на ветру (Swaying Shader), Bloom-свечение лавы и Depth of Field.
                   </li>
                   <li>
-                    <b>Мини-карта [M]:</b> Радар спавна (0,0), деревень, кладов, друзей и мобов + быстрый телепорт.
+                    <b>Пещеры и Подземелья (Кнопка «В Данж»):</b> Подземные залы с мшистым булыжником, лавой, алмазными и золотыми жилами и сундуками сокровищ.
                   </li>
                   <li>
-                    <b>Авто-смена дня и ночи:</b> Ночью спавнятся Зомби и Криперы (сражайтесь ЛКМ за алмазы и изумруды).
+                    <b>Динамическая погода:</b> Дождь, Гроза со вспышками 3D-молний и раскатами грома, объёмный туман и снег в горных биомах.
                   </li>
                   <li>
-                    <b>Ивенты «Поиск клада» и «Метеорит»:</b> Ищите сундуки с сокровищами по координатам!
+                    <b>ИИ Питомцев (Волки) + Чары и Зелья [E]:</b> Прирученные волки атакуют монстров ночью и приносят руду днём; стол зачарований и варочная стойка дают Скорость II и Ночное зрение!
                   </li>
                 </ul>
               </div>
