@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+}
+
+.font-pixel {
+  font-family: 'Press Start 2P', monospace;
+}
+
+.font-mono-tabular {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.pixelated {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+.mc-panel {
+  background-color: #c6c6c6;
+  border-top: 3px solid #ffffff;
+  border-left: 3px solid #ffffff;
+  border-right: 3px solid #555555;
+  border-bottom: 3px solid #555555;
+  box-shadow: 0 0 0 2px #000000;
+}
+
+.mc-slot {
+  background-color: #8b8b8b;
+  border-top: 2px solid #373737;
+  border-left: 2px solid #373737;
+  border-right: 2px solid #ffffff;
+  border-bottom: 2px solid #ffffff;
+}
+
+.mc-btn {
+  background-color: #7d7d7d;
+  border-top: 2px solid #bababa;
+  border-left: 2px solid #bababa;
+  border-right: 2px solid #3b3b3b;
+  border-bottom: 2px solid #3b3b3b;
+  text-shadow: 2px 2px 0px #242424;
+}
+
+.mc-btn:hover {
+  background-color: #8e9c6b;
+  border-top-color: #c5d69c;
+  border-left-color: #c5d69c;
+}
+
+.mc-btn:active {
+  border-top: 2px solid #3b3b3b;
+  border-left: 2px solid #3b3b3b;
+  border-right: 2px solid #bababa;
+  border-bottom: 2px solid #bababa;
+}
+

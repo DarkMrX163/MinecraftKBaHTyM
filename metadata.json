@@ -1,0 +1,6 @@
+{
+  "name": "Minecraft Voxel Edition",
+  "description": "Cross-platform real-time multiplayer voxel sandbox with authentic block textures, procedural biomes, crafting, and articulated 3D characters.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
