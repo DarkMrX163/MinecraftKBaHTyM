@@ -28,6 +28,10 @@ export enum BlockId {
   BEDROCK = 24,
   DIAMOND_BLOCK = 25,
   GOLD_BLOCK = 26,
+  DOOR_CLOSED = 27,
+  DOOR_OPEN = 28,
+  TREASURE_CHEST = 29,
+  EMERALD_BLOCK = 30,
 }
 
 export interface BlockDefinition {
@@ -36,6 +40,7 @@ export interface BlockDefinition {
   nameRu: string;
   transparent?: boolean;
   fluid?: boolean;
+  passable?: boolean; // player can walk through (e.g. open door)
   lightLevel?: number;
   hardness: number; // seconds to break by hand
   unbreakable?: boolean;
@@ -86,6 +91,12 @@ export const TILE_INDEX = {
   BEDROCK: 33,
   DIAMOND_BLOCK: 34,
   GOLD_BLOCK: 35,
+  DOOR_CLOSED_FACE: 36,
+  DOOR_OPEN_FACE: 37,
+  CHEST_TOP: 38,
+  CHEST_SIDE: 39,
+  CHEST_FRONT: 40,
+  EMERALD_BLOCK: 41,
 };
 
 export const BLOCKS: Record<number, BlockDefinition> = {
@@ -493,6 +504,69 @@ export const BLOCKS: Record<number, BlockDefinition> = {
     ],
     iconTile: TILE_INDEX.GOLD_BLOCK,
   },
+  [BlockId.DOOR_CLOSED]: {
+    id: BlockId.DOOR_CLOSED,
+    name: 'Oak Door (Closed)',
+    nameRu: 'Деревянная дверь (ПКМ — открыть)',
+    transparent: true,
+    hardness: 0.8,
+    faces: [
+      TILE_INDEX.OAK_PLANKS,
+      TILE_INDEX.OAK_PLANKS,
+      TILE_INDEX.DOOR_CLOSED_FACE,
+      TILE_INDEX.DOOR_CLOSED_FACE,
+      TILE_INDEX.DOOR_CLOSED_FACE,
+      TILE_INDEX.DOOR_CLOSED_FACE,
+    ],
+    iconTile: TILE_INDEX.DOOR_CLOSED_FACE,
+  },
+  [BlockId.DOOR_OPEN]: {
+    id: BlockId.DOOR_OPEN,
+    name: 'Oak Door (Open)',
+    nameRu: 'Деревянная дверь (ПКМ — закрыть)',
+    transparent: true,
+    passable: true,
+    hardness: 0.8,
+    faces: [
+      TILE_INDEX.DOOR_OPEN_FACE,
+      TILE_INDEX.DOOR_OPEN_FACE,
+      TILE_INDEX.DOOR_OPEN_FACE,
+      TILE_INDEX.DOOR_OPEN_FACE,
+      TILE_INDEX.DOOR_OPEN_FACE,
+      TILE_INDEX.DOOR_OPEN_FACE,
+    ],
+    iconTile: TILE_INDEX.DOOR_CLOSED_FACE,
+  },
+  [BlockId.TREASURE_CHEST]: {
+    id: BlockId.TREASURE_CHEST,
+    name: 'Treasure Chest',
+    nameRu: 'Сундук с сокровищами (ПКМ — открыть)',
+    hardness: 1.2,
+    faces: [
+      TILE_INDEX.CHEST_TOP,
+      TILE_INDEX.CHEST_TOP,
+      TILE_INDEX.CHEST_FRONT,
+      TILE_INDEX.CHEST_SIDE,
+      TILE_INDEX.CHEST_FRONT,
+      TILE_INDEX.CHEST_SIDE,
+    ],
+    iconTile: TILE_INDEX.CHEST_FRONT,
+  },
+  [BlockId.EMERALD_BLOCK]: {
+    id: BlockId.EMERALD_BLOCK,
+    name: 'Emerald Block',
+    nameRu: 'Изумрудный блок',
+    hardness: 2.0,
+    faces: [
+      TILE_INDEX.EMERALD_BLOCK,
+      TILE_INDEX.EMERALD_BLOCK,
+      TILE_INDEX.EMERALD_BLOCK,
+      TILE_INDEX.EMERALD_BLOCK,
+      TILE_INDEX.EMERALD_BLOCK,
+      TILE_INDEX.EMERALD_BLOCK,
+    ],
+    iconTile: TILE_INDEX.EMERALD_BLOCK,
+  },
 };
 
 export const PLACEABLE_BLOCKS: BlockId[] = [
@@ -502,8 +576,10 @@ export const PLACEABLE_BLOCKS: BlockId[] = [
   BlockId.COBBLESTONE,
   BlockId.OAK_LOG,
   BlockId.OAK_PLANKS,
+  BlockId.DOOR_CLOSED,
   BlockId.CRAFTING_TABLE,
   BlockId.FURNACE,
+  BlockId.TREASURE_CHEST,
   BlockId.GLASS,
   BlockId.BRICK,
   BlockId.SAND,
@@ -513,6 +589,7 @@ export const PLACEABLE_BLOCKS: BlockId[] = [
   BlockId.BOOKSHELF,
   BlockId.GLOWSTONE,
   BlockId.TNT,
+  BlockId.EMERALD_BLOCK,
   BlockId.DIAMOND_BLOCK,
   BlockId.GOLD_BLOCK,
   BlockId.OBSIDIAN,
@@ -788,11 +865,10 @@ export function getMinecraftAtlas(): GeneratedAtlas {
       }
     }
   }
-  // Write TNT letters in black pixels
   const tntPixels = [
-    [2,6],[3,6],[4,6],[3,7],[3,8],[3,9], // T
-    [6,6],[6,7],[6,8],[6,9],[7,7],[8,8],[9,6],[9,7],[9,8],[9,9], // N
-    [11,6],[12,6],[13,6],[12,7],[12,8],[12,9], // T
+    [2,6],[3,6],[4,6],[3,7],[3,8],[3,9],
+    [6,6],[6,7],[6,8],[6,9],[7,7],[8,8],[9,6],[9,7],[9,8],[9,9],
+    [11,6],[12,6],[13,6],[12,7],[12,8],[12,9],
   ];
   for (const [px, py] of tntPixels) {
     drawPixel(TILE_INDEX.TNT_SIDE, px, py, '#191919');
@@ -856,6 +932,67 @@ export function getMinecraftAtlas(): GeneratedAtlas {
     drawPixel(TILE_INDEX.GOLD_BLOCK, 0, i, '#fff59e');
     drawPixel(TILE_INDEX.GOLD_BLOCK, i, 15, '#c99c18');
     drawPixel(TILE_INDEX.GOLD_BLOCK, 15, i, '#c99c18');
+  }
+
+  // 36: DOOR_CLOSED_FACE (Oak door with upper window pane & golden handle)
+  fillNoiseTile(TILE_INDEX.DOOR_CLOSED_FACE, '#8f6b3e', 12);
+  for (let i = 0; i < 16; i++) {
+    drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, i, 0, '#5e4322');
+    drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, i, 15, '#5e4322');
+    drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, 0, i, '#5e4322');
+    drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, 15, i, '#5e4322');
+  }
+  // Window grilles in upper half
+  for (let y = 3; y <= 7; y++) {
+    for (let x = 3; x <= 12; x++) {
+      if (x !== 7 && x !== 8 && y !== 5) {
+        drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, x, y, 'rgba(180, 230, 255, 0.35)');
+      }
+    }
+  }
+  // Door handle
+  drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, 12, 9, '#fcee4b');
+  drawPixel(TILE_INDEX.DOOR_CLOSED_FACE, 13, 9, '#c99c18');
+
+  // 37: DOOR_OPEN_FACE (Thin wooden jamb on left side, open doorway in middle)
+  const txDO = (TILE_INDEX.DOOR_OPEN_FACE % ATLAS_COLS) * TILE_SIZE;
+  const tyDO = Math.floor(TILE_INDEX.DOOR_OPEN_FACE / ATLAS_COLS) * TILE_SIZE;
+  ctx.clearRect(txDO, tyDO, 16, 16);
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 3; x++) {
+      drawPixel(TILE_INDEX.DOOR_OPEN_FACE, x, y, x === 2 ? '#5e4322' : '#8f6b3e');
+    }
+  }
+
+  // 38, 39, 40: TREASURE CHEST
+  fillNoiseTile(TILE_INDEX.CHEST_TOP, '#9c6e27', 12);
+  fillNoiseTile(TILE_INDEX.CHEST_SIDE, '#9c6e27', 12);
+  fillNoiseTile(TILE_INDEX.CHEST_FRONT, '#9c6e27', 12);
+  for (const t of [TILE_INDEX.CHEST_TOP, TILE_INDEX.CHEST_SIDE, TILE_INDEX.CHEST_FRONT]) {
+    for (let i = 0; i < 16; i++) {
+      drawPixel(t, i, 0, '#3b2610');
+      drawPixel(t, i, 15, '#3b2610');
+      drawPixel(t, 0, i, '#3b2610');
+      drawPixel(t, 15, i, '#3b2610');
+      if (t !== TILE_INDEX.CHEST_TOP) {
+        drawPixel(t, i, 5, '#2b1b0a');
+      }
+    }
+  }
+  // Golden latch on front of chest
+  for (let y = 4; y <= 7; y++) {
+    for (let x = 7; x <= 8; x++) {
+      drawPixel(TILE_INDEX.CHEST_FRONT, x, y, '#fcee4b');
+    }
+  }
+
+  // 41: EMERALD_BLOCK
+  fillNoiseTile(TILE_INDEX.EMERALD_BLOCK, '#27c95a', 16);
+  for (let i = 0; i < 16; i++) {
+    drawPixel(TILE_INDEX.EMERALD_BLOCK, i, 0, '#7affa2');
+    drawPixel(TILE_INDEX.EMERALD_BLOCK, 0, i, '#7affa2');
+    drawPixel(TILE_INDEX.EMERALD_BLOCK, i, 15, '#128034');
+    drawPixel(TILE_INDEX.EMERALD_BLOCK, 15, i, '#128034');
   }
 
   const texture = new THREE.CanvasTexture(canvas);

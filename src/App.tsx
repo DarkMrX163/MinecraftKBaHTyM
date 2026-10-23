@@ -13,6 +13,8 @@ import { VoxelWorld, WATER_LEVEL } from './game/world';
 import {
   VoxelCharacterModel,
   PassiveMobModel,
+  VillagerMobModel,
+  HostileMobModel,
   SKIN_PALETTES,
 } from './game/playerModel';
 import {
@@ -49,6 +51,9 @@ import {
   Globe,
   ExternalLink,
   RefreshCw,
+  Compass,
+  MapPin,
+  Sword,
 } from 'lucide-react';
 
 interface ParticleBurst {
@@ -65,6 +70,16 @@ interface ActiveRoomSummary {
   weather: string;
 }
 
+interface WorldEventQuest {
+  id: string;
+  type: 'treasure' | 'meteor';
+  title: string;
+  x: number;
+  y: number;
+  z: number;
+  foundCount: number;
+}
+
 // Reusable module-scope math vectors to prevent GC in animation loop
 const _forward = new THREE.Vector3();
 const _right = new THREE.Vector3();
@@ -77,6 +92,7 @@ const _curSky = new THREE.Color();
 
 export default function App() {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
+  const miniMapCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Parse room from URL query for instant cross-platform friend invite
   const initialRoomFromUrl = (() => {
@@ -84,10 +100,11 @@ export default function App() {
     return params.get('room') || 'overworld-1';
   })();
 
-  const [inTitleScreen, setInTitleScreen] = useState<boolean>(false);
+  // Open on the Join / Nickname screen by default so players joining via link enter their nickname & click "Войти"
+  const [inTitleScreen, setInTitleScreen] = useState<boolean>(true);
   const [showGithubModal, setShowGithubModal] = useState<boolean>(false);
   const [playerName, setPlayerName] = useState<string>(() => {
-    return localStorage.getItem('mc_player_name') || `Steve_${Math.floor(100 + Math.random() * 899)}`;
+    return localStorage.getItem('mc_player_name') || `Игрок_${Math.floor(100 + Math.random() * 899)}`;
   });
   const [selectedSkin, setSelectedSkin] = useState<string>(() => {
     return localStorage.getItem('mc_player_skin') || 'steve';
@@ -98,7 +115,7 @@ export default function App() {
 
   // GitHub Publisher States
   const [ghToken, setGhToken] = useState<string>(() => localStorage.getItem('mc_gh_token') || '');
-  const [ghRepoName, setGhRepoName] = useState<string>('minecraft-voxel-online');
+  const [ghRepoName, setGhRepoName] = useState<string>('MinecraftKBaHTyM');
   const [ghDescription, setGhDescription] = useState<string>(
     'Minecraft Voxel Edition — 3D WebGL & Cross-Platform Online Multiplayer (WebRTC P2P + WebSocket)'
   );
@@ -123,6 +140,8 @@ export default function App() {
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
   const [isPointerLocked, setIsPointerLocked] = useState<boolean>(false);
   const [isTouchDevice, setIsTouchDevice] = useState<boolean>(false);
+  const [showMiniMap, setShowMiniMap] = useState<boolean>(true);
+  const [autoDayNight, setAutoDayNight] = useState<boolean>(true);
 
   // Inventory & Hotbar
   const [hotbar, setHotbar] = useState<InventorySlot[]>(INITIAL_HOTBAR);
@@ -140,6 +159,19 @@ export default function App() {
   });
   const [targetBlockName, setTargetBlockName] = useState<string | null>(null);
   const [miningProgress, setMiningProgress] = useState<number>(0);
+  const [hostileCount, setHostileCount] = useState<number>(0);
+  const [eventBanner, setEventBanner] = useState<string | null>(null);
+
+  // Treasure Hunt / World Event state
+  const [activeQuest, setActiveQuest] = useState<WorldEventQuest>({
+    id: 'quest-1',
+    type: 'treasure',
+    title: 'Поиск древнего клада',
+    x: 28,
+    y: 20,
+    z: -26,
+    foundCount: 0,
+  });
 
   // Multiplayer & World environment
   const [netStatus, setNetStatus] = useState<{
@@ -157,7 +189,7 @@ export default function App() {
   const [activeRoomsList, setActiveRoomsList] = useState<ActiveRoomSummary[]>([]);
   const [chatMessages, setChatMessages] = useState<NetworkChatPayload[]>([]);
   const [chatDraft, setChatDraft] = useState<string>('');
-  const [timeOfDay, setTimeOfDay] = useState<number>(0.25); // 0.25 = Noon
+  const [timeOfDay, setTimeOfDay] = useState<number>(0.25); // 0.25 = Noon, 0.75 = Midnight
   const [weather, setWeather] = useState<'clear' | 'rain' | 'snow'>('clear');
 
   // Mutable refs for 60fps Three.js game loop access
@@ -176,6 +208,9 @@ export default function App() {
     timeOfDay,
     weather,
     health,
+    autoDayNight,
+    showMiniMap,
+    activeQuest,
   });
 
   useEffect(() => {
@@ -194,6 +229,9 @@ export default function App() {
       timeOfDay,
       weather,
       health,
+      autoDayNight,
+      showMiniMap,
+      activeQuest,
     };
   }, [
     inTitleScreen,
@@ -210,6 +248,9 @@ export default function App() {
     timeOfDay,
     weather,
     health,
+    autoDayNight,
+    showMiniMap,
+    activeQuest,
   ]);
 
   // Refs to engine instances
@@ -223,9 +264,14 @@ export default function App() {
   const keysRef = useRef<Record<string, boolean>>({});
   const mouseDownLeftRef = useRef<boolean>(false);
   const touchMoveVecRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const triggerActionRef = useRef<{ breakBlock: () => void; placeBlock: () => void }>({
+  const triggerActionRef = useRef<{
+    breakBlock: () => void;
+    placeBlock: () => void;
+    spawnEvent: (eventType?: 'treasure' | 'meteor') => void;
+  }>({
     breakBlock: () => {},
     placeBlock: () => {},
+    spawnEvent: () => {},
   });
 
   // Detect touch device on mount
@@ -268,7 +314,7 @@ export default function App() {
     setTimeout(() => setCopiedLink(false), 2200);
   }, [roomId]);
 
-  // Publish to GitHub handler (works both via server proxy and direct browser GitHub API)
+  // Publish to GitHub handler
   const handlePublishToGitHub = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!ghToken.trim()) {
@@ -314,9 +360,14 @@ export default function App() {
     if (blockId === BlockId.AIR) return;
     setHotbar((prev) => {
       const next = prev.map((s) => ({ ...s }));
-      const existingIdx = next.findIndex((s) => s.blockId === blockId);
+      const existingIdx = next.findIndex((s) => s.blockId === blockId && s.count > 0);
       if (existingIdx !== -1) {
         next[existingIdx].count = Math.min(999, next[existingIdx].count + amount);
+        return next;
+      }
+      const emptyIdx = next.findIndex((s) => s.count <= 0);
+      if (emptyIdx !== -1) {
+        next[emptyIdx] = { blockId, count: amount };
         return next;
       }
       next[stateRef.current.activeSlot] = { blockId, count: amount };
@@ -396,10 +447,24 @@ export default function App() {
     const t = typeof newTime === 'number' ? newTime : stateRef.current.timeOfDay;
     const w = newWeather || stateRef.current.weather;
     setTimeOfDay(t);
+    stateRef.current.timeOfDay = t;
     setWeather(w);
     if (netRef.current) {
       netRef.current.sendWorldEnv(t, w);
     }
+  }, []);
+
+  // Teleport helper for quick navigation to Spawn, Village, or Quest
+  const teleportPlayerTo = useCallback((tx: number, tz: number, label: string) => {
+    const world = worldRef.current;
+    if (!world) return;
+    soundEngine.playClick();
+    world.updateChunksAroundPlayer(tx, tz, 2);
+    const ty = world.getTerrainHeight(Math.floor(tx), Math.floor(tz)).height;
+    playerPosRef.current.set(tx + 0.5, Math.max(ty + 1.2, WATER_LEVEL + 2), tz + 0.5);
+    playerVelRef.current.set(0, 0, 0);
+    setEventBanner(`Перемещение: ${label} (${tx}, ${tz})`);
+    setTimeout(() => setEventBanner(null), 3200);
   }, []);
 
   // Main Three.js & Dual-Transport Online Multiplayer Initialization
@@ -512,11 +577,13 @@ export default function App() {
     playerPosRef.current.set(0.5, Math.max(spawnGroundY + 1.05, WATER_LEVEL + 2), 0.5);
     world.updateChunksAroundPlayer(0, 0, 2);
 
+    // Show nameplate on local player too so nickname is visible above head in 3rd-person view
+    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     const localPlayerModel = new VoxelCharacterModel(
       stateRef.current.playerName,
       stateRef.current.selectedSkin,
-      'desktop',
-      false
+      isTouch ? 'mobile' : 'desktop',
+      true
     );
     localPlayerModel.group.visible = false;
     scene.add(localPlayerModel.group);
@@ -576,7 +643,10 @@ export default function App() {
     scene.add(crackMesh);
 
     const mobs: PassiveMobModel[] = [];
-    const spawnMobs = () => {
+    const villagers: VillagerMobModel[] = [];
+    const hostileMobs: HostileMobModel[] = [];
+
+    const spawnMobsAndVillagers = () => {
       for (const m of mobs) scene.remove(m.group);
       mobs.length = 0;
       const mobCoords = [
@@ -595,13 +665,38 @@ export default function App() {
           mobs.push(mob);
         }
       }
+
+      // Spawn Villagers in all 3 distant Villages
+      for (const v of villagers) scene.remove(v.group);
+      villagers.length = 0;
+      const villagerProfessions = [
+        { role: 'Житель-Кузнец', color: '#4a3525', dx: 3, dz: 2 },
+        { role: 'Житель-Фермер', color: '#7c5832', dx: -3, dz: 3 },
+        { role: 'Житель-Торговец', color: '#2b5b84', dx: 2, dz: -3 },
+      ];
+      for (const vc of VoxelWorld.VILLAGE_CENTERS) {
+        for (const prof of villagerProfessions) {
+          const vx = vc.x + prof.dx;
+          const vz = vc.z + prof.dz;
+          const vy = world.getTerrainHeight(vx, vz).height + 1;
+          const villager = new VillagerMobModel(
+            `${prof.role} (${vc.nameRu.split(' ')[0]})`,
+            prof.color,
+            vx + 0.5,
+            vy,
+            vz + 0.5
+          );
+          scene.add(villager.group);
+          villagers.push(villager);
+        }
+      }
     };
-    spawnMobs();
+    spawnMobsAndVillagers();
 
     const particles: ParticleBurst[] = [];
     const partGeo = new THREE.BoxGeometry(0.16, 0.16, 0.16);
-    const spawnBlockParticles = (bx: number, by: number, bz: number, count = 14) => {
-      const mat = new THREE.MeshLambertMaterial({ color: 0x999999 });
+    const spawnBlockParticles = (bx: number, by: number, bz: number, count = 14, colorHex = 0x999999) => {
+      const mat = new THREE.MeshLambertMaterial({ color: colorHex });
       for (let i = 0; i < count; i++) {
         const mesh = new THREE.Mesh(partGeo, mat);
         mesh.position.set(
@@ -621,6 +716,66 @@ export default function App() {
         });
       }
     };
+
+    // Spawn a Treasure Chest or Meteor Event in the world
+    const spawnWorldQuestEvent = (eventType: 'treasure' | 'meteor' = 'treasure', announce = true) => {
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 26 + Math.floor(Math.random() * 30);
+      const qx = Math.round(playerPosRef.current.x + Math.cos(angle) * dist);
+      const qz = Math.round(playerPosRef.current.z + Math.sin(angle) * dist);
+      world.updateChunksAroundPlayer(qx, qz, 1);
+      const qy = Math.max(world.getTerrainHeight(qx, qz).height + 1, WATER_LEVEL + 1);
+
+      if (eventType === 'meteor') {
+        // Build a glowing meteorite crater with gold/diamond ore & treasure chest
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dz = -1; dz <= 1; dz++) {
+            world.setBlock(qx + dx, qy - 1, qz + dz, BlockId.COBBLESTONE, false);
+          }
+        }
+        world.setBlock(qx + 1, qy, qz, BlockId.GOLD_ORE, false);
+        world.setBlock(qx - 1, qy, qz, BlockId.DIAMOND_ORE, false);
+        world.setBlock(qx, qy + 1, qz, BlockId.GLOWSTONE, false);
+        world.setBlock(qx, qy, qz, BlockId.TREASURE_CHEST, true);
+      } else {
+        // Place Treasure Chest on a Gold/Brick pedestal with a Glowstone beacon
+        world.setBlock(qx, qy - 1, qz, BlockId.GOLD_BLOCK, false);
+        world.setBlock(qx, qy + 2, qz, BlockId.GLOWSTONE, false);
+        world.setBlock(qx, qy, qz, BlockId.TREASURE_CHEST, true);
+      }
+
+      const nextQuest: WorldEventQuest = {
+        id: `q_${Date.now()}`,
+        type: eventType,
+        title: eventType === 'meteor' ? 'Звёздный метеорит' : 'Поиск древнего клада',
+        x: qx,
+        y: qy,
+        z: qz,
+        foundCount: stateRef.current.activeQuest.foundCount,
+      };
+      setActiveQuest(nextQuest);
+      stateRef.current.activeQuest = nextQuest;
+
+      if (announce) {
+        const msg =
+          eventType === 'meteor'
+            ? `☄️ Ивент «Звёздный метеорит» упал на координатах X:${qx} Z:${qz}!`
+            : `🗺️ Ивент «Поиск клада»: сундук спрятан на X:${qx} Z:${qz}!`;
+        setEventBanner(msg);
+        setTimeout(() => setEventBanner(null), 5000);
+      }
+    };
+
+    // Place initial treasure chest at (28, -26)
+    {
+      const initX = 28;
+      const initZ = -26;
+      const initY = Math.max(world.getTerrainHeight(initX, initZ).height + 1, WATER_LEVEL + 1);
+      world.setBlock(initX, initY - 1, initZ, BlockId.GOLD_BLOCK, false);
+      world.setBlock(initX, initY + 2, initZ, BlockId.GLOWSTONE, false);
+      world.setBlock(initX, initY, initZ, BlockId.TREASURE_CHEST, true);
+      setActiveQuest((prev) => ({ ...prev, x: initX, y: initY, z: initZ }));
+    }
 
     const weatherCount = 240;
     const weatherGeo = new THREE.BufferGeometry();
@@ -658,14 +813,13 @@ export default function App() {
           heldBlockId: 1,
           swinging: false,
           sneaking: false,
-          deviceType: 'desktop',
+          deviceType: model.deviceType,
         });
       }
       setOnlinePlayers(arr);
     };
 
     // Initialize Dual-Transport Online Multiplayer (WebSocket + WebRTC PeerJS)
-    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
     const netManager = new MultiplayerManager(initialRoomFromUrl, selfIdRef.current, {
       onStatusChange: (st) => {
         setNetStatus(st);
@@ -692,7 +846,7 @@ export default function App() {
         ).height;
         playerPosRef.current.y = Math.max(sy + 1.05, WATER_LEVEL + 2);
         world.updateChunksAroundPlayer(playerPosRef.current.x, playerPosRef.current.z, 2);
-        spawnMobs();
+        spawnMobsAndVillagers();
 
         for (const [, m] of remoteModels.entries()) {
           scene.remove(m.group);
@@ -715,12 +869,17 @@ export default function App() {
         }
       },
       onPlayerJoined: (p, chat) => {
-        if (p.id !== selfIdRef.current && !remoteModels.has(p.id)) {
-          const model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
-          model.group.position.set(p.x, p.y, p.z);
-          model.targetPos.set(p.x, p.y, p.z);
-          scene.add(model.group);
-          remoteModels.set(p.id, model);
+        if (p.id !== selfIdRef.current) {
+          let model = remoteModels.get(p.id);
+          if (!model) {
+            model = new VoxelCharacterModel(p.name, p.skin, p.deviceType, true);
+            model.group.position.set(p.x, p.y, p.z);
+            model.targetPos.set(p.x, p.y, p.z);
+            scene.add(model.group);
+            remoteModels.set(p.id, model);
+          } else {
+            model.setName(p.name, p.deviceType);
+          }
           syncRemotePlayersList();
         }
         if (chat) {
@@ -735,6 +894,9 @@ export default function App() {
           model.group.position.set(p.x, p.y, p.z);
           scene.add(model.group);
           remoteModels.set(p.id, model);
+          syncRemotePlayersList();
+        } else if (model.playerName !== p.name) {
+          model.setName(p.name, p.deviceType);
           syncRemotePlayersList();
         }
         model.targetPos.set(p.x, p.y, p.z);
@@ -788,6 +950,7 @@ export default function App() {
       },
       onWorldEnvUpdated: (t, w) => {
         setTimeOfDay(t);
+        stateRef.current.timeOfDay = t;
         setWeather(w);
       },
       onChatMessage: (chat) => {
@@ -812,6 +975,7 @@ export default function App() {
     netRef.current = netManager;
 
     (window as unknown as { __switchMcRoom?: (r: string) => void }).__switchMcRoom = (newRoom: string) => {
+      localPlayerModel.setName(stateRef.current.playerName, isTouch ? 'mobile' : 'desktop');
       netManager.switchRoom(newRoom, {
         id: selfIdRef.current,
         name: stateRef.current.playerName,
@@ -854,7 +1018,7 @@ export default function App() {
 
     const detonateTNT = (tx: number, ty: number, tz: number) => {
       soundEngine.playExplosion();
-      spawnBlockParticles(tx, ty, tz, 28);
+      spawnBlockParticles(tx, ty, tz, 28, 0xff5533);
       const updates: { x: number; y: number; z: number; blockId: number }[] = [];
       const dirtyChunks = new Set<string>();
 
@@ -895,15 +1059,143 @@ export default function App() {
       }
     };
 
+    const openTreasureChest = (cx: number, cy: number, cz: number) => {
+      soundEngine.playExplosion();
+      spawnBlockParticles(cx, cy, cz, 26, 0xffd700);
+      world.setBlock(cx, cy, cz, BlockId.AIR, true);
+      netManager.sendBlockUpdate(cx, cy, cz, BlockId.AIR);
+
+      addBlockToInventory(BlockId.DIAMOND_BLOCK, 4);
+      addBlockToInventory(BlockId.EMERALD_BLOCK, 8);
+      addBlockToInventory(BlockId.GOLD_BLOCK, 6);
+      addBlockToInventory(BlockId.TNT, 8);
+      setHealth(20);
+
+      const bannerMsg = `🏆 Сундук сокровищ открыт! Получено: +4 Алмазных, +8 Изумрудных, +6 Золотых блоков!`;
+      setEventBanner(bannerMsg);
+      setTimeout(() => setEventBanner(null), 5500);
+
+      netManager.sendChat(
+        `🏆 нашёл и открыл Сундук Сокровищ на (${cx}, ${cz})!`,
+        stateRef.current.playerName
+      );
+
+      setActiveQuest((prev) => ({ ...prev, foundCount: prev.foundCount + 1 }));
+      // Spawn next treasure quest automatically
+      setTimeout(() => {
+        spawnWorldQuestEvent(Math.random() > 0.4 ? 'treasure' : 'meteor', true);
+      }, 1500);
+    };
+
+    const toggleVillageDoor = (dx: number, dy: number, dz: number, currentId: number) => {
+      const targetId =
+        currentId === BlockId.DOOR_CLOSED ? BlockId.DOOR_OPEN : BlockId.DOOR_CLOSED;
+      soundEngine.playClick();
+      world.setBlock(dx, dy, dz, targetId, true);
+      netManager.sendBlockUpdate(dx, dy, dz, targetId);
+
+      // Toggle upper or lower half of the 2-block-tall door automatically
+      const aboveId = world.getBlock(dx, dy + 1, dz);
+      if (aboveId === BlockId.DOOR_CLOSED || aboveId === BlockId.DOOR_OPEN) {
+        world.setBlock(dx, dy + 1, dz, targetId, true);
+        netManager.sendBlockUpdate(dx, dy + 1, dz, targetId);
+      }
+      const belowId = world.getBlock(dx, dy - 1, dz);
+      if (belowId === BlockId.DOOR_CLOSED || belowId === BlockId.DOOR_OPEN) {
+        world.setBlock(dx, dy - 1, dz, targetId, true);
+        netManager.sendBlockUpdate(dx, dy - 1, dz, targetId);
+      }
+    };
+
     let handSwingAnim = 0;
 
+    // Attack hostile mobs or trade with villagers on left/right click
+    const tryAttackHostileMob = (): boolean => {
+      const eyeOrigin = new THREE.Vector3(
+        playerPosRef.current.x,
+        playerPosRef.current.y + PLAYER_EYE_H,
+        playerPosRef.current.z
+      );
+      camera.getWorldDirection(_rayDir);
+
+      let closestIdx = -1;
+      let closestDist = 4.3;
+
+      for (let i = 0; i < hostileMobs.length; i++) {
+        const hm = hostileMobs[i];
+        const mobCenter = new THREE.Vector3(hm.position.x, hm.position.y + 1.0, hm.position.z);
+        const toMob = mobCenter.sub(eyeOrigin);
+        const dist = toMob.length();
+        if (dist < closestDist) {
+          toMob.normalize();
+          const dot = toMob.dot(_rayDir);
+          if (dot > 0.72) {
+            closestDist = dist;
+            closestIdx = i;
+          }
+        }
+      }
+
+      if (closestIdx !== -1) {
+        const targetMob = hostileMobs[closestIdx];
+        soundEngine.playBlockHit(0.65);
+        spawnBlockParticles(
+          targetMob.position.x,
+          targetMob.position.y + 1.0,
+          targetMob.position.z,
+          10,
+          0xcc2222
+        );
+        const died = targetMob.takeDamage(1, _rayDir);
+        if (died) {
+          scene.remove(targetMob.group);
+          hostileMobs.splice(closestIdx, 1);
+          setHostileCount(hostileMobs.length);
+          soundEngine.playBlockBreak();
+          addBlockToInventory(BlockId.EMERALD_BLOCK, 2);
+          addBlockToInventory(BlockId.DIAMOND_ORE, 1);
+          setEventBanner(`⚔️ Монстр повержен! Добыча: +2 Изумрудных блока и +1 Алмазная руда`);
+          setTimeout(() => setEventBanner(null), 3000);
+        }
+        return true;
+      }
+      return false;
+    };
+
+    const tryInteractWithVillager = (): boolean => {
+      for (const v of villagers) {
+        const dist = v.position.distanceTo(playerPosRef.current);
+        if (dist <= 4.2) {
+          soundEngine.playClick();
+          addBlockToInventory(BlockId.EMERALD_BLOCK, 2);
+          addBlockToInventory(BlockId.GLOWSTONE, 4);
+          setHealth((h) => Math.min(20, h + 4));
+          setEventBanner(
+            `🤝 ${v.professionName}: «Добро пожаловать в нашу деревню! Держи +2 Изумрудных блока и +4 Светокамня!»`
+          );
+          setTimeout(() => setEventBanner(null), 4000);
+          return true;
+        }
+      }
+      return false;
+    };
+
     const executeBreakBlock = (bx: number, by: number, bz: number, blockId: number) => {
+      if (blockId === BlockId.TREASURE_CHEST) {
+        openTreasureChest(bx, by, bz);
+        return;
+      }
       if (BLOCKS[blockId]?.unbreakable && stateRef.current.gameMode !== 'creative') return;
       world.setBlock(bx, by, bz, BlockId.AIR, true);
       spawnBlockParticles(bx, by, bz, 14);
       soundEngine.playBlockBreak();
 
-      const dropId = blockId === BlockId.STONE ? BlockId.COBBLESTONE : blockId;
+      const dropId =
+        blockId === BlockId.STONE
+          ? BlockId.COBBLESTONE
+          : blockId === BlockId.DOOR_OPEN
+          ? BlockId.DOOR_CLOSED
+          : blockId;
       addBlockToInventory(dropId, 1);
       netManager.sendBlockUpdate(bx, by, bz, BlockId.AIR);
     };
@@ -911,6 +1203,9 @@ export default function App() {
     const executePlaceBlock = () => {
       handSwingAnim = 0.26;
       localPlayerModel.triggerSwing();
+
+      // Check villager interaction first if close
+      if (tryInteractWithVillager()) return;
 
       const eyeOrigin = new THREE.Vector3(
         playerPosRef.current.x,
@@ -922,6 +1217,19 @@ export default function App() {
       if (!hit) return;
 
       const [hx, hy, hz] = hit.hitBlock;
+
+      // Toggle open/close on village house doors!
+      if (hit.blockId === BlockId.DOOR_CLOSED || hit.blockId === BlockId.DOOR_OPEN) {
+        toggleVillageDoor(hx, hy, hz, hit.blockId);
+        return;
+      }
+
+      // Open Treasure Chest on right-click!
+      if (hit.blockId === BlockId.TREASURE_CHEST) {
+        openTreasureChest(hx, hy, hz);
+        return;
+      }
+
       if (hit.blockId === BlockId.CRAFTING_TABLE && !keysRef.current['ShiftLeft']) {
         soundEngine.playClick();
         setShowInventory(true);
@@ -954,13 +1262,20 @@ export default function App() {
         py >= playerMinY &&
         py <= playerMaxY &&
         pz >= playerMinZ &&
-        pz <= playerMaxZ
+        pz <= playerMaxZ &&
+        !BLOCKS[slot.blockId]?.passable
       ) {
         return;
       }
 
       world.setBlock(px, py, pz, slot.blockId, true);
       soundEngine.playBlockPlace();
+
+      // If placing a door, also place upper half if air
+      if (slot.blockId === BlockId.DOOR_CLOSED && world.getBlock(px, py + 1, pz) === BlockId.AIR) {
+        world.setBlock(px, py + 1, pz, BlockId.DOOR_CLOSED, true);
+        netManager.sendBlockUpdate(px, py + 1, pz, BlockId.DOOR_CLOSED);
+      }
 
       if (stateRef.current.gameMode === 'survival') {
         setHotbar((prev) => {
@@ -980,6 +1295,7 @@ export default function App() {
       breakBlock: () => {
         handSwingAnim = 0.26;
         localPlayerModel.triggerSwing();
+        if (tryAttackHostileMob()) return;
         const eyeOrigin = new THREE.Vector3(
           playerPosRef.current.x,
           playerPosRef.current.y + PLAYER_EYE_H,
@@ -992,6 +1308,7 @@ export default function App() {
         }
       },
       placeBlock: executePlaceBlock,
+      spawnEvent: (eventType = 'treasure') => spawnWorldQuestEvent(eventType, true),
     };
 
     const onPointerLockChange = () => {
@@ -1066,6 +1383,8 @@ export default function App() {
         setDockCollapsed((c) => !c);
       } else if (e.code === 'KeyC') {
         setGameMode((m) => (m === 'survival' ? 'creative' : 'survival'));
+      } else if (e.code === 'KeyM') {
+        setShowMiniMap((m) => !m);
       }
     };
 
@@ -1091,6 +1410,7 @@ export default function App() {
         handSwingAnim = 0.26;
         localPlayerModel.triggerSwing();
         netManager.sendSwing();
+        tryAttackHostileMob();
       } else if (e.button === 2) {
         executePlaceBlock();
       } else if (e.button === 1) {
@@ -1159,6 +1479,153 @@ export default function App() {
       frameId = window.setTimeout(poll, 5);
     }
 
+    // Mini-map 2D canvas renderer
+    const drawMiniMap = () => {
+      const canvas = miniMapCanvasRef.current;
+      if (!canvas || !stateRef.current.showMiniMap) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const W = canvas.width;
+      const H = canvas.height;
+      const halfW = W / 2;
+      const halfH = H / 2;
+      const px = playerPosRef.current.x;
+      const pz = playerPosRef.current.z;
+
+      ctx.fillStyle = '#101820';
+      ctx.fillRect(0, 0, W, H);
+
+      // Sample terrain grid around player (radius 48 blocks, step 3 blocks)
+      const range = 48;
+      const step = 3;
+      const scale = halfW / range;
+
+      for (let dz = -range; dz <= range; dz += step) {
+        for (let dx = -range; dx <= range; dx += step) {
+          const wx = Math.floor(px + dx);
+          const wz = Math.floor(pz + dz);
+          const info = world.getTerrainHeight(wx, wz);
+          if (info.height <= WATER_LEVEL) {
+            ctx.fillStyle = '#1e4d8c';
+          } else if (info.biome === 'desert') {
+            ctx.fillStyle = '#c2b267';
+          } else if (info.biome === 'snow') {
+            ctx.fillStyle = '#d9e3ec';
+          } else if (info.biome === 'forest') {
+            ctx.fillStyle = '#2d6326';
+          } else {
+            ctx.fillStyle = '#4c8527';
+          }
+          const sx = halfW + dx * scale;
+          const sy = halfH + dz * scale;
+          ctx.fillRect(sx, sy, Math.ceil(step * scale), Math.ceil(step * scale));
+        }
+      }
+
+      // Helper to project world coords onto radar (clamped to border if far away)
+      const projectPoint = (wx: number, wz: number) => {
+        const dx = (wx - px) * scale;
+        const dz = (wz - pz) * scale;
+        const dist = Math.hypot(dx, dz);
+        const maxR = halfW - 10;
+        if (dist > maxR) {
+          const ratio = maxR / dist;
+          return { x: halfW + dx * ratio, y: halfH + dz * ratio, clamped: true };
+        }
+        return { x: halfW + dx, y: halfH + dz, clamped: false };
+      };
+
+      // 1. Draw Villages (Emerald House icons)
+      for (const vc of VoxelWorld.VILLAGE_CENTERS) {
+        const pt = projectPoint(vc.x, vc.z);
+        ctx.fillStyle = '#10b981';
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, pt.clamped ? 4.5 : 5.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+
+      // 2. Draw World Spawn (0, 0) Star/Cross
+      const spawnPt = projectPoint(0, 0);
+      ctx.fillStyle = '#38bdf8';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 1.5;
+      ctx.fillRect(spawnPt.x - 4, spawnPt.y - 4, 8, 8);
+      ctx.strokeRect(spawnPt.x - 4, spawnPt.y - 4, 8, 8);
+
+      // 3. Draw Active Treasure Hunt / Meteor Quest (Gold X)
+      const q = stateRef.current.activeQuest;
+      const questPt = projectPoint(q.x, q.z);
+      ctx.strokeStyle = '#fbbf24';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(questPt.x - 5, questPt.y - 5);
+      ctx.lineTo(questPt.x + 5, questPt.y + 5);
+      ctx.moveTo(questPt.x + 5, questPt.y - 5);
+      ctx.lineTo(questPt.x - 5, questPt.y + 5);
+      ctx.stroke();
+
+      // 4. Draw Hostile Mobs (Red dots)
+      ctx.fillStyle = '#ef4444';
+      for (const hm of hostileMobs) {
+        const pt = projectPoint(hm.position.x, hm.position.z);
+        if (!pt.clamped) {
+          ctx.fillRect(pt.x - 2, pt.y - 2, 4, 4);
+        }
+      }
+
+      // 5. Draw Remote Online Players (Cyan dots)
+      ctx.fillStyle = '#22d3ee';
+      for (const [, rm] of remoteModels.entries()) {
+        const pt = projectPoint(rm.group.position.x, rm.group.position.z);
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 6. Draw Local Player & View Direction Cone at center
+      ctx.save();
+      ctx.translate(halfW, halfH);
+      // Player look direction in world: (-sin(yaw), -cos(yaw))
+      const angle = Math.atan2(-Math.cos(yawRef.current), -Math.sin(yawRef.current));
+      ctx.rotate(angle);
+
+      // View cone
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.arc(0, 0, 22, -0.45, 0.45);
+      ctx.closePath();
+      ctx.fill();
+
+      // Player arrow
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(6, 0);
+      ctx.lineTo(-4, -4);
+      ctx.lineTo(-2, 0);
+      ctx.lineTo(-4, 4);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+
+      // Cardinal letters N/S/W/E
+      ctx.font = 'bold 10px monospace';
+      ctx.fillStyle = '#f87171';
+      ctx.textAlign = 'center';
+      ctx.fillText('N', halfW, 10);
+      ctx.fillStyle = '#d4d4d8';
+      ctx.fillText('S', halfW, H - 3);
+      ctx.fillText('W', 7, halfH + 3);
+      ctx.fillText('E', W - 7, halfH + 3);
+    };
+
     const clock = new THREE.Clock();
     let currentMiningTargetKey = '';
     let currentMiningTimer = 0;
@@ -1167,11 +1634,51 @@ export default function App() {
     let networkSendAccum = 0;
     let uiCoordAccum = 0;
     let walkBobTimer = 0;
+    let hostileSpawnAccum = 0;
 
     function tick() {
       const delta = Math.min(clock.getDelta(), 0.1);
       const elapsed = clock.getElapsedTime();
       const st = stateRef.current;
+
+      // Update local player overhead nickname if changed
+      localPlayerModel.setName(st.playerName, isTouch ? 'mobile' : 'desktop');
+
+      // Automatic Day/Night Cycle progression
+      if (st.autoDayNight) {
+        const nextTime = (st.timeOfDay + delta * 0.0045) % 1;
+        st.timeOfDay = nextTime;
+      }
+
+      const isNight = st.timeOfDay >= 0.55 || st.timeOfDay <= 0.05;
+
+      // Nighttime Hostile Mob Spawning & Daytime Burn
+      hostileSpawnAccum += delta;
+      if (hostileSpawnAccum > 3.5) {
+        hostileSpawnAccum = 0;
+        if (isNight && hostileMobs.length < 9 && !st.inTitleScreen) {
+          const angle = Math.random() * Math.PI * 2;
+          const dist = 12 + Math.random() * 14;
+          const mx = Math.floor(playerPosRef.current.x + Math.cos(angle) * dist);
+          const mz = Math.floor(playerPosRef.current.z + Math.sin(angle) * dist);
+          const my = world.getTerrainHeight(mx, mz).height + 1;
+          if (my > WATER_LEVEL + 1) {
+            const kind = Math.random() > 0.4 ? 'zombie' : 'creeper';
+            const hm = new HostileMobModel(kind, mx + 0.5, my, mz + 0.5);
+            scene.add(hm.group);
+            hostileMobs.push(hm);
+            setHostileCount(hostileMobs.length);
+          }
+        } else if (!isNight && hostileMobs.length > 2) {
+          // Daylight despawns excess night monsters
+          const burned = hostileMobs.pop();
+          if (burned) {
+            spawnBlockParticles(burned.position.x, burned.position.y + 1, burned.position.z, 8, 0xff8800);
+            scene.remove(burned.group);
+            setHostileCount(hostileMobs.length);
+          }
+        }
+      }
 
       const activeBlockId = st.hotbar[st.activeSlot]?.blockId || BlockId.GRASS;
       updateHeldBlockUV(activeBlockId);
@@ -1451,8 +1958,34 @@ export default function App() {
         model.update(delta, distSq > 0.002, false);
       }
 
+      const groundFn = (x: number, z: number) =>
+        world.getTerrainHeight(Math.floor(x), Math.floor(z)).height + 1;
+
       for (const mob of mobs) {
-        mob.update(delta, (x, z) => world.getTerrainHeight(Math.floor(x), Math.floor(z)).height + 1);
+        mob.update(delta, groundFn);
+      }
+
+      for (const v of villagers) {
+        v.update(delta, playerPosRef.current, groundFn);
+      }
+
+      for (const hm of hostileMobs) {
+        hm.update(delta, playerPosRef.current, groundFn, (dmg) => {
+          if (st.gameMode === 'survival' && !st.inTitleScreen) {
+            soundEngine.playBlockHit(0.5);
+            setHealth((h) => {
+              const nextH = h - dmg;
+              if (nextH <= 0) {
+                const sy = world.getTerrainHeight(0, 0).height;
+                playerPosRef.current.set(0.5, sy + 2, 0.5);
+                setEventBanner('💀 Вы погибли в бою с ночными монстрами! Возрождение на спавне (0, 0).');
+                setTimeout(() => setEventBanner(null), 4000);
+                return 20;
+              }
+              return nextH;
+            });
+          }
+        });
       }
 
       for (let i = particles.length - 1; i >= 0; i--) {
@@ -1516,7 +2049,7 @@ export default function App() {
       }
 
       uiCoordAccum += delta;
-      if (uiCoordAccum > 0.25) {
+      if (uiCoordAccum > 0.2) {
         uiCoordAccum = 0;
         const bx = Math.floor(playerPosRef.current.x);
         const by = Math.floor(playerPosRef.current.y);
@@ -1534,6 +2067,10 @@ export default function App() {
           z: bz,
           biome: biomeMap[bInfo.biome] || 'Равнины',
         });
+        if (st.autoDayNight) {
+          setTimeOfDay(st.timeOfDay);
+        }
+        drawMiniMap();
       }
 
       renderer.render(scene, camera);
@@ -1566,6 +2103,10 @@ export default function App() {
 
   const handleSwitchRoom = (e?: React.FormEvent, targetRoomOverride?: string) => {
     if (e) e.preventDefault();
+    const trimmedName = playerName.trim() || `Игрок_${Math.floor(100 + Math.random() * 899)}`;
+    setPlayerName(trimmedName);
+    stateRef.current.playerName = trimmedName;
+
     const raw = targetRoomOverride ?? roomInput;
     const cleaned = raw.trim().toLowerCase().replace(/[^a-z0-9-_]/g, '') || 'overworld-1';
     setRoomId(cleaned);
@@ -1576,6 +2117,7 @@ export default function App() {
     const switchFn = (window as unknown as { __switchMcRoom?: (r: string) => void }).__switchMcRoom;
     if (switchFn) switchFn(cleaned);
     setInTitleScreen(false);
+    soundEngine.playClick();
   };
 
   const touchLookRef = useRef<{ id: number; lastX: number; lastY: number } | null>(null);
@@ -1610,6 +2152,11 @@ export default function App() {
 
   const currentSlot = hotbar[activeSlot];
   const currentBlockDef = currentSlot ? BLOCKS[currentSlot.blockId] : null;
+  const isNightTime = timeOfDay >= 0.55 || timeOfDay <= 0.05;
+  const distToQuest = Math.round(
+    Math.hypot(activeQuest.x - coords.x, activeQuest.z - coords.z)
+  );
+  const distToSpawn = Math.round(Math.hypot(coords.x, coords.z));
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#111] select-none">
@@ -1624,6 +2171,13 @@ export default function App() {
           onTouchMove={handleTouchLookMove}
           onTouchEnd={handleTouchLookEnd}
         />
+      )}
+
+      {/* Event / Achievement Banner Notification */}
+      {eventBanner && !inTitleScreen && (
+        <div className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-30 bg-black/90 border-2 border-amber-400 px-4 py-2 text-xs font-bold text-amber-200 shadow-2xl text-center max-w-md">
+          {eventBanner}
+        </div>
       )}
 
       {/* Center Crosshair & Mining Progress Bar */}
@@ -1649,57 +2203,112 @@ export default function App() {
         </div>
       )}
 
-      {/* Minimal Top-Left Spec & Online Multiplayer Bar */}
-      <div className="pointer-events-auto absolute top-3 left-3 z-20 flex flex-wrap items-center gap-2 bg-black/80 border border-white/15 px-3 py-1.5 text-xs text-neutral-200">
-        <button
-          onClick={() => {
-            if (document.pointerLockElement) document.exitPointerLock();
-            setInTitleScreen(true);
-          }}
-          className="font-pixel text-[11px] text-emerald-400 hover:text-emerald-300 tracking-tight cursor-pointer whitespace-nowrap"
-        >
-          MINECRAFT ONLINE
-        </button>
-        <span aria-hidden="true" className="text-neutral-500">·</span>
-        <span className="font-mono-tabular whitespace-nowrap">
-          XYZ: {coords.x} / {coords.y} / {coords.z}
-        </span>
-        <span aria-hidden="true" className="text-neutral-500">·</span>
-        <button
-          onClick={() => {
-            if (document.pointerLockElement) document.exitPointerLock();
-            setInTitleScreen(true);
-          }}
-          className="font-mono-tabular text-amber-300 hover:underline cursor-pointer whitespace-nowrap flex items-center gap-1"
-          title="Сменить онлайн-комнату или сервер"
-        >
-          <Globe className="w-3.5 h-3.5 text-emerald-400" />
-          <span>
-            Сервер: {roomId} ({onlinePlayers.length + 1} онлайн)
+      {/* Top-Left Spec Bar + Survival HUD Mini-Map */}
+      <div className="pointer-events-auto absolute top-3 left-3 z-20 flex flex-col items-start gap-2 max-w-[92vw]">
+        <div className="flex flex-wrap items-center gap-2 bg-black/80 border border-white/15 px-3 py-1.5 text-xs text-neutral-200">
+          <button
+            onClick={() => {
+              if (document.pointerLockElement) document.exitPointerLock();
+              setInTitleScreen(true);
+            }}
+            className="font-pixel text-[11px] text-emerald-400 hover:text-emerald-300 tracking-tight cursor-pointer whitespace-nowrap"
+          >
+            MINECRAFT ONLINE
+          </button>
+          <span aria-hidden="true" className="text-neutral-500">·</span>
+          <span className="font-mono-tabular text-white font-semibold whitespace-nowrap">
+            Ник: {playerName}
           </span>
-        </button>
+          <span aria-hidden="true" className="text-neutral-500">·</span>
+          <span className="font-mono-tabular whitespace-nowrap">
+            XYZ: {coords.x} / {coords.y} / {coords.z}
+          </span>
+          <span aria-hidden="true" className="text-neutral-500">·</span>
+          <button
+            onClick={() => {
+              if (document.pointerLockElement) document.exitPointerLock();
+              setInTitleScreen(true);
+            }}
+            className="font-mono-tabular text-amber-300 hover:underline cursor-pointer whitespace-nowrap flex items-center gap-1"
+            title="Сменить никнейм или онлайн-комнату"
+          >
+            <Globe className="w-3.5 h-3.5 text-emerald-400" />
+            <span>
+              Сервер: {roomId} ({onlinePlayers.length + 1} игр.)
+            </span>
+          </button>
 
-        <button
-          onClick={handleCopyInvite}
-          className="flex items-center gap-1 px-2 py-0.5 bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap"
-          title="Скопировать ссылку для приглашения друга в этот мир"
-        >
-          {copiedLink ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-          <span>{copiedLink ? 'Ссылка скопирована' : 'Пригласить по ссылке'}</span>
-        </button>
+          <button
+            onClick={handleCopyInvite}
+            className="flex items-center gap-1 px-2 py-0.5 bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap"
+            title="Скопировать ссылку для приглашения друга в этот мир"
+          >
+            {copiedLink ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+            <span>{copiedLink ? 'Ссылка скопирована' : 'Пригласить по ссылке'}</span>
+          </button>
+        </div>
 
-        <button
-          onClick={() => {
-            soundEngine.playClick();
-            if (document.pointerLockElement) document.exitPointerLock();
-            setShowGithubModal(true);
-          }}
-          className="flex items-center gap-1 px-2.5 py-0.5 bg-neutral-800 hover:bg-neutral-700 border border-white/25 text-white text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap"
-          title="Создать репозиторий и ссылку на GitHub / GitHub Pages"
-        >
-          <Github className="w-3.5 h-3.5" />
-          <span>Создать ссылку на GitHub</span>
-        </button>
+        {/* Survival HUD Mini-Map & World Navigation Radar */}
+        {!inTitleScreen && showMiniMap && (
+          <div className="bg-black/85 border-2 border-neutral-600 p-2 w-48 text-[11px] text-neutral-200 shadow-xl space-y-1.5">
+            <div className="flex items-center justify-between border-b border-white/15 pb-1">
+              <span className="font-bold text-emerald-400 flex items-center gap-1">
+                <Compass className="w-3.5 h-3.5" />
+                <span>МИНИ-КАРТА [M]</span>
+              </span>
+              <span className="font-mono-tabular text-[10px] text-neutral-400">
+                Спавн: {distToSpawn}м
+              </span>
+            </div>
+
+            <div className="relative flex items-center justify-center">
+              <canvas
+                ref={miniMapCanvasRef}
+                width={156}
+                height={156}
+                className="w-[156px] h-[156px] border border-white/25 pixelated"
+              />
+            </div>
+
+            {/* Map Legend */}
+            <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] text-neutral-300">
+              <div className="flex items-center gap-1">
+                <span className="w-2 h-2 bg-sky-400 inline-block" />
+                <span>Спавн (0,0)</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 inline-block" />
+                <span>Деревни (3)</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="w-2 h-2 bg-amber-400 inline-block" />
+                <span>Клад ({distToQuest}м)</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <span className="w-2 h-2 bg-red-500 inline-block" />
+                <span>Мобы ({hostileCount})</span>
+              </div>
+            </div>
+
+            {/* Quick Navigation & Village Teleport Buttons */}
+            <div className="pt-1 border-t border-white/15 flex flex-wrap gap-1">
+              <button
+                onClick={() => teleportPlayerTo(0, 0, 'Спавн мира')}
+                className="flex-1 px-1.5 py-1 bg-sky-900/70 hover:bg-sky-800 border border-sky-400/40 text-[10px] text-sky-200 cursor-pointer text-center"
+                title="Вернуться на точку спавна (0, 0)"
+              >
+                На Спавн
+              </button>
+              <button
+                onClick={() => teleportPlayerTo(40, -34, 'Северная Деревня')}
+                className="flex-1 px-1.5 py-1 bg-emerald-900/70 hover:bg-emerald-800 border border-emerald-400/40 text-[10px] text-emerald-200 cursor-pointer text-center"
+                title="Переместиться к Северной Деревне с жителями и домами"
+              >
+                В Деревню
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Pointer Lock Prompt Pill */}
@@ -1710,13 +2319,13 @@ export default function App() {
         !showInventory &&
         !showChat && (
           <div className="pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-20 bg-black/80 border border-amber-400/40 px-4 py-1.5 text-xs text-amber-200 whitespace-nowrap">
-            Кликните по 3D-миру для игры (WASD — ход, ЛКМ — ломать, ПКМ — ставить, E — крафт)
+            Кликните по 3D-миру для игры (ПКМ по двери — открыть/закрыть, ПКМ по сундуку — забрать клад)
           </div>
         )}
 
-      {/* Live Multiplayer Chat Box (Top-Right compact overlay) */}
-      <div className="pointer-events-auto absolute top-3 right-3 z-20 w-72 max-w-[85vw] flex flex-col items-end">
-        <div className="w-full bg-black/75 border border-white/15 p-2 text-xs space-y-1 max-h-36 overflow-y-auto">
+      {/* Live Multiplayer Chat Box + Active World Event Card (Top-Right overlay) */}
+      <div className="pointer-events-auto absolute top-3 right-3 z-20 w-72 max-w-[85vw] flex flex-col items-end gap-2">
+        <div className="w-full bg-black/75 border border-white/15 p-2 text-xs space-y-1 max-h-32 overflow-y-auto">
           {chatMessages.slice(-6).map((msg) => (
             <div key={msg.id} className="leading-snug break-words">
               <span
@@ -1731,13 +2340,13 @@ export default function App() {
           ))}
         </div>
         {showChat ? (
-          <form onSubmit={handleSendChat} className="w-full mt-1 flex gap-1">
+          <form onSubmit={handleSendChat} className="w-full flex gap-1">
             <input
               type="text"
               autoFocus
               value={chatDraft}
               onChange={(e) => setChatDraft(e.target.value)}
-              placeholder="Чат или /time day, /weather snow..."
+              placeholder="Чат или сообщение друзьям..."
               className="flex-1 bg-black/90 border border-white/30 px-2.5 py-1 text-xs text-white focus:outline-none focus:border-emerald-400"
             />
             <button
@@ -1750,11 +2359,57 @@ export default function App() {
         ) : (
           <button
             onClick={() => setShowChat(true)}
-            className="mt-1 flex items-center gap-1.5 px-2.5 py-1 bg-black/75 hover:bg-black/90 border border-white/15 text-[11px] text-neutral-300 cursor-pointer whitespace-nowrap"
+            className="flex items-center gap-1.5 px-2.5 py-1 bg-black/75 hover:bg-black/90 border border-white/15 text-[11px] text-neutral-300 cursor-pointer whitespace-nowrap"
           >
             <MessageSquare className="w-3 h-3 text-emerald-400" />
             <span>Онлайн-чат [T]</span>
           </button>
+        )}
+
+        {/* Active Treasure Hunt / World Event HUD Card */}
+        {!inTitleScreen && (
+          <div className="w-full bg-black/85 border border-amber-400/50 p-2.5 text-xs text-neutral-200 space-y-1.5">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-amber-300 flex items-center gap-1">
+                <MapPin className="w-3.5 h-3.5 text-amber-400" />
+                <span>ИВЕНТ: {activeQuest.title}</span>
+              </span>
+              <span className="px-1.5 py-0.5 bg-amber-900/70 text-amber-200 text-[10px] font-mono-tabular">
+                Найдено: {activeQuest.foundCount}
+              </span>
+            </div>
+            <div className="text-[11px] text-neutral-300 font-mono-tabular flex items-center justify-between">
+              <span>
+                Цель: X:{activeQuest.x} Z:{activeQuest.z}
+              </span>
+              <span className="text-emerald-300 font-bold">До клада: {distToQuest} м</span>
+            </div>
+            <div className="flex items-center gap-1 pt-0.5">
+              <button
+                onClick={() => triggerActionRef.current.spawnEvent('treasure')}
+                className="flex-1 px-2 py-1 bg-amber-800/80 hover:bg-amber-700 border border-amber-400/40 text-[10px] text-white font-semibold cursor-pointer"
+                title="Спрятать новый сундук с сокровищами"
+              >
+                Новый клад
+              </button>
+              <button
+                onClick={() => triggerActionRef.current.spawnEvent('meteor')}
+                className="flex-1 px-2 py-1 bg-purple-900/80 hover:bg-purple-800 border border-purple-400/40 text-[10px] text-white font-semibold cursor-pointer"
+                title="Вызвать падение метеорита с рудой и сокровищами"
+              >
+                Метеорит
+              </button>
+              <button
+                onClick={() =>
+                  teleportPlayerTo(activeQuest.x, activeQuest.z + 2, activeQuest.title)
+                }
+                className="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 border border-white/20 text-[10px] text-amber-200 cursor-pointer"
+                title="Переместиться к месту ивента"
+              >
+                К цели
+              </button>
+            </div>
+          </div>
         )}
       </div>
 
@@ -1811,7 +2466,7 @@ export default function App() {
               }}
               className="mc-btn px-4 py-3 text-xs font-bold text-red-200"
             >
-              ЛОМАТЬ
+              УДАР / ЛОМАТЬ
             </button>
             <button
               onTouchStart={(e) => {
@@ -1820,7 +2475,7 @@ export default function App() {
               }}
               className="mc-btn px-4 py-3 text-xs font-bold text-emerald-200"
             >
-              СТАВИТЬ
+              ОТКР. / СТАВИТЬ
             </button>
           </div>
         </>
@@ -1830,7 +2485,7 @@ export default function App() {
       <div
         className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center transition-transform duration-200"
         style={{
-          maxWidth: 'min(940px, 95vw)',
+          maxWidth: 'min(960px, 96vw)',
           transform: dockCollapsed ? 'translateY(calc(100% - 28px))' : 'translateY(0)',
         }}
       >
@@ -1947,7 +2602,7 @@ export default function App() {
               className="px-2.5 py-1 bg-emerald-800/80 hover:bg-emerald-700 border border-emerald-400/40 flex items-center gap-1 cursor-pointer whitespace-nowrap text-white"
             >
               <Users className="w-3 h-3" />
-              <span>Онлайн-комнаты ({onlinePlayers.length + 1})</span>
+              <span>Ник и Сервер ({onlinePlayers.length + 1})</span>
             </button>
 
             <button
@@ -1992,22 +2647,45 @@ export default function App() {
                 {cameraMode === 'first'
                   ? '1-е лицо'
                   : cameraMode === 'third-back'
-                  ? '3-е сзади'
+                  ? '3-е (виден ник)'
                   : '3-е спереди'}{' '}
                 [V]
               </span>
             </button>
 
             <button
-              onClick={() => updateWorldEnv(timeOfDay < 0.5 ? 0.75 : 0.25, weather)}
-              className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-white/15 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+              onClick={() => updateWorldEnv(!isNightTime ? 0.75 : 0.25, weather)}
+              className={`px-2.5 py-1 border flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                isNightTime
+                  ? 'bg-indigo-950/90 border-indigo-400 text-indigo-200'
+                  : 'bg-neutral-800 hover:bg-neutral-700 border-white/15'
+              }`}
+              title="Переключить День / Ночь (ночью спавнятся враждебные мобы)"
             >
-              {timeOfDay < 0.55 && timeOfDay > 0.05 ? (
+              {!isNightTime ? (
                 <Sun className="w-3 h-3 text-amber-300" />
               ) : (
                 <Moon className="w-3 h-3 text-indigo-300" />
               )}
-              <span>{timeOfDay < 0.55 && timeOfDay > 0.05 ? 'День' : 'Ночь'}</span>
+              <span>
+                {!isNightTime ? 'День' : `Ночь (Мобов: ${hostileCount})`}
+              </span>
+            </button>
+
+            <button
+              onClick={() => {
+                soundEngine.playClick();
+                setAutoDayNight((a) => !a);
+              }}
+              className={`px-2 py-1 border flex items-center gap-1 cursor-pointer whitespace-nowrap ${
+                autoDayNight
+                  ? 'bg-amber-900/60 border-amber-400/50 text-amber-200'
+                  : 'bg-neutral-800 border-white/15 text-neutral-400'
+              }`}
+              title="Автоматическая смена дня и ночи"
+            >
+              <Sword className="w-3 h-3" />
+              <span>Авто-сутки: {autoDayNight ? 'ВКЛ' : 'ВЫКЛ'}</span>
             </button>
 
             <button
@@ -2147,44 +2825,47 @@ export default function App() {
         </div>
       )}
 
-      {/* Online Multiplayer Server Browser & Room Lobby Modal */}
+      {/* Join Screen / Nickname Entry & Online Multiplayer Server Lobby Modal */}
       {inTitleScreen && (
         <div className="pointer-events-auto fixed inset-0 z-40 bg-black/80 flex items-center justify-center p-4">
           <div className="mc-panel w-full max-w-2xl p-6 text-neutral-900 max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b-2 border-neutral-500 pb-3 mb-4">
               <div>
                 <h1 className="font-pixel text-base sm:text-lg text-neutral-900 tracking-tight">
-                   СЕТЕВАЯ ИГРА MINECRAFT
+                  ВХОД В МИР MINECRAFT ONLINE
                 </h1>
                 <p className="text-xs text-neutral-700 mt-1">
-                  Двойной протокол связи: WebSocket Сервер + WebRTC P2P (PeerJS) для игры по сети и на GitHub Pages
+                  Введите ваш никнейм и нажмите «ВОЙТИ В МИР» — ваш ник будет отображаться над головой персонажа у всех игроков!
                 </p>
               </div>
               <button
-                onClick={() => setInTitleScreen(false)}
-                className="mc-btn px-3 py-1.5 text-xs font-bold text-white cursor-pointer"
+                onClick={() => handleSwitchRoom()}
+                className="mc-btn px-4 py-2 text-xs font-bold text-emerald-300 cursor-pointer"
               >
-                В ИГРУ
+                ВОЙТИ
               </button>
             </div>
 
             <form onSubmit={(e) => handleSwitchRoom(e)} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs font-bold text-neutral-800 mb-1">
-                    Ваш никнейм
+                  <label className="block text-xs font-bold text-neutral-900 mb-1">
+                    Ваш никнейм (высвечивается над игроком)
                   </label>
                   <input
                     type="text"
+                    required
+                    autoFocus
                     value={playerName}
                     onChange={(e) => setPlayerName(e.target.value)}
+                    placeholder="Введите ваш ник..."
                     maxLength={18}
-                    className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-sm text-white font-mono-tabular focus:outline-none"
+                    className="w-full bg-[#2b2b2b] border-2 border-emerald-400 px-3 py-2.5 text-sm text-white font-mono-tabular focus:outline-none"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-neutral-800 mb-1">
+                  <label className="block text-xs font-bold text-neutral-900 mb-1">
                     Код онлайн-комнаты (сервера)
                   </label>
                   <div className="flex gap-1.5">
@@ -2194,13 +2875,13 @@ export default function App() {
                       onChange={(e) => setRoomInput(e.target.value)}
                       maxLength={24}
                       placeholder="overworld-1"
-                      className="flex-1 bg-[#373737] border-2 border-white px-3 py-2 text-sm text-amber-300 font-mono-tabular focus:outline-none"
+                      className="flex-1 bg-[#373737] border-2 border-white px-3 py-2.5 text-sm text-amber-300 font-mono-tabular focus:outline-none"
                     />
                     <button
                       type="submit"
-                      className="mc-btn px-3 py-2 text-xs font-bold text-white cursor-pointer whitespace-nowrap"
+                      className="mc-btn px-4 py-2.5 text-xs font-bold text-emerald-300 cursor-pointer whitespace-nowrap"
                     >
-                      Подключиться
+                      ВОЙТИ
                     </button>
                   </div>
                 </div>
@@ -2224,7 +2905,7 @@ export default function App() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-32 overflow-y-auto bg-[#999] p-2 border border-neutral-600">
                   {activeRoomsList.length === 0 ? (
                     <div className="text-xs text-neutral-800 col-span-2 py-2 text-center">
-                      Комната <b>{roomId}</b> активна (P2P WebRTC + WebSocket)
+                      Комната <b>{roomId}</b> готова к игре (WebRTC P2P + WebSocket)
                     </div>
                   ) : (
                     activeRoomsList.map((r) => (
@@ -2289,22 +2970,23 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Network Telemetry & Invite Link */}
-              <div className="bg-[#a8a8a8] border border-neutral-600 p-3 text-xs space-y-1">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="font-bold text-neutral-900 flex items-center gap-1.5">
-                    <Users className="w-4 h-4" />
-                    Протоколы:{' '}
-                    {netStatus.wsConnected ? 'WebSocket Онлайн' : 'Автономный'} +{' '}
-                    {netStatus.p2pConnected
-                      ? `WebRTC P2P (${netStatus.p2pRole === 'host' ? 'Хост комнаты' : 'Клиент'})`
-                      : 'P2P соединение...'}
-                  </span>
-                  <span className="font-mono-tabular text-neutral-800">Сид: {worldSeed}</span>
-                </div>
-                <p className="text-neutral-800">
-                  Скопируйте пригласительную ссылку или опубликуйте игру на свой GitHub — друзья смогут зайти с компьютера или телефона в реальном времени!
-                </p>
+              {/* New Features Summary Box */}
+              <div className="bg-[#a8a8a8] border border-neutral-600 p-3 text-xs space-y-1 text-neutral-900">
+                <div className="font-bold">Что нового в мире:</div>
+                <ul className="list-disc list-inside space-y-0.5 text-[11px]">
+                  <li>
+                    <b>Деревни и жители:</b> 3 деревни вокруг спавна с домами, открывающимися дверями (ПКМ) и жителями-торговцами.
+                  </li>
+                  <li>
+                    <b>Мини-карта [M]:</b> Радар спавна (0,0), деревень, кладов, друзей и мобов + быстрый телепорт.
+                  </li>
+                  <li>
+                    <b>Авто-смена дня и ночи:</b> Ночью спавнятся Зомби и Криперы (сражайтесь ЛКМ за алмазы и изумруды).
+                  </li>
+                  <li>
+                    <b>Ивенты «Поиск клада» и «Метеорит»:</b> Ищите сундуки с сокровищами по координатам!
+                  </li>
+                </ul>
               </div>
 
               <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
@@ -2317,206 +2999,14 @@ export default function App() {
                     {copiedLink ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                     <span>{copiedLink ? 'Ссылка скопирована!' : 'Ссылка для друга'}</span>
                   </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setInTitleScreen(false);
-                      setShowGithubModal(true);
-                    }}
-                    className="mc-btn px-3.5 py-2.5 text-xs font-bold text-amber-200 flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Github className="w-4 h-4" />
-                    <span>Создать ссылку на GitHub</span>
-                  </button>
                 </div>
 
                 <button
                   type="submit"
-                  className="mc-btn px-6 py-2.5 text-xs font-bold text-white flex items-center gap-2 cursor-pointer"
+                  className="mc-btn px-6 py-2.5 text-xs font-bold text-emerald-300 flex items-center gap-2 cursor-pointer"
                 >
                   <Play className="w-4 h-4 fill-current" />
-                  <span>ИГРАТЬ ОНЛАЙН</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* GitHub Repository & GitHub Pages Link Generator Modal */}
-      {showGithubModal && (
-        <div className="pointer-events-auto fixed inset-0 z-50 bg-black/85 flex items-center justify-center p-4">
-          <div className="mc-panel w-full max-w-xl p-6 text-neutral-900 max-h-[92vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b-2 border-neutral-500 pb-3 mb-4">
-              <div className="flex items-center gap-2">
-                <Github className="w-5 h-5 text-neutral-900" />
-                <h2 className="font-pixel text-sm text-neutral-900">
-                  ПУБЛИКАЦИЯ НА GITHUB
-                </h2>
-              </div>
-              <button
-                onClick={() => setShowGithubModal(false)}
-                className="mc-btn px-3 py-1 text-xs font-bold text-white cursor-pointer"
-              >
-                ЗАКРЫТЬ
-              </button>
-            </div>
-
-            <p className="text-xs text-neutral-800 mb-4 leading-relaxed">
-              Создайте собственный репозиторий на <b>GitHub</b> с полным исходным кодом игры, текстурами и автоматическим деплоем на <b>GitHub Pages</b>. Благодаря встроенному <b>WebRTC P2P (PeerJS)</b> мультиплееру, по вашей ссылке на GitHub можно играть онлайн с друзьями без платного хостинга!
-            </p>
-
-            <form onSubmit={handlePublishToGitHub} className="space-y-3.5">
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="text-xs font-bold text-neutral-900">
-                    GitHub Personal Access Token (PAT)
-                  </label>
-                  <a
-                    href="https://github.com/settings/tokens/new?scopes=repo,workflow&description=Minecraft+Voxel+Edition"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[11px] text-blue-800 hover:underline flex items-center gap-1 font-semibold"
-                  >
-                    <span>Получить токен на GitHub (права repo + workflow)</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                </div>
-                <input
-                  type="password"
-                  required
-                  value={ghToken}
-                  onChange={(e) => setGhToken(e.target.value)}
-                  placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-                  className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-xs text-white font-mono-tabular focus:outline-none"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-neutral-900 mb-1">
-                    Название репозитория
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={ghRepoName}
-                    onChange={(e) => setGhRepoName(e.target.value)}
-                    placeholder="minecraft-voxel-online"
-                    className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-xs text-amber-300 font-mono-tabular focus:outline-none"
-                  />
-                </div>
-
-                <div className="flex items-end pb-1">
-                  <label className="flex items-center gap-2 text-xs font-bold text-neutral-900 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={ghPrivate}
-                      onChange={(e) => setGhPrivate(e.target.checked)}
-                      className="w-4 h-4"
-                    />
-                    <span>Приватный репозиторий</span>
-                  </label>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-neutral-900 mb-1">
-                  Описание репозитория
-                </label>
-                <input
-                  type="text"
-                  value={ghDescription}
-                  onChange={(e) => setGhDescription(e.target.value)}
-                  className="w-full bg-[#373737] border-2 border-white px-3 py-2 text-xs text-white focus:outline-none"
-                />
-              </div>
-
-              {ghError && (
-                <div className="bg-red-900/90 border border-red-400 text-red-100 p-2.5 text-xs">
-                  {ghError}
-                </div>
-              )}
-
-              {ghResult && (
-                <div className="bg-emerald-900 border-2 border-emerald-400 text-white p-3.5 space-y-2.5 text-xs">
-                  <div className="font-bold text-emerald-300">
-                    Готово! Загружено файлов: {ghResult.uploadedCount}
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <div className="text-[11px] text-neutral-200">Ссылка на ваш GitHub репозиторий:</div>
-                    <div className="flex items-center gap-1.5">
-                      <input
-                        type="text"
-                        readOnly
-                        value={ghResult.repoUrl}
-                        className="flex-1 bg-black/60 border border-white/30 px-2.5 py-1.5 text-xs font-mono-tabular text-amber-300"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          navigator.clipboard.writeText(ghResult.repoUrl).catch(() => {});
-                          setCopiedGhLink('repo');
-                          setTimeout(() => setCopiedGhLink(null), 2000);
-                        }}
-                        className="mc-btn px-2.5 py-1.5 text-xs text-white cursor-pointer"
-                      >
-                        {copiedGhLink === 'repo' ? 'Скопировано' : 'Копировать'}
-                      </button>
-                      <a
-                        href={ghResult.repoUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="mc-btn px-2.5 py-1.5 text-xs text-white flex items-center gap-1"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                      </a>
-                    </div>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <div className="text-[11px] text-neutral-200">
-                      Ссылка на онлайн-игру GitHub Pages (активируется после сборки Actions ~1 мин):
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <input
-                        type="text"
-                        readOnly
-                        value={`${ghResult.pagesUrl}?room=${roomId}`}
-                        className="flex-1 bg-black/60 border border-white/30 px-2.5 py-1.5 text-xs font-mono-tabular text-emerald-300"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          navigator.clipboard
-                            .writeText(`${ghResult.pagesUrl}?room=${roomId}`)
-                            .catch(() => {});
-                          setCopiedGhLink('pages');
-                          setTimeout(() => setCopiedGhLink(null), 2000);
-                        }}
-                        className="mc-btn px-2.5 py-1.5 text-xs text-white cursor-pointer"
-                      >
-                        {copiedGhLink === 'pages' ? 'Скопировано' : 'Копировать'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex items-center justify-end gap-2 pt-2">
-                <button
-                  type="submit"
-                  disabled={ghPublishing}
-                  className="mc-btn px-5 py-2.5 text-xs font-bold text-white flex items-center gap-2 cursor-pointer disabled:opacity-50"
-                >
-                  <Github className="w-4 h-4" />
-                  <span>
-                    {ghPublishing
-                      ? 'Загрузка файлов на GitHub...'
-                      : 'Создать репозиторий и получить ссылку GitHub'}
-                  </span>
+                  <span>ВОЙТИ В МИР</span>
                 </button>
               </div>
             </form>

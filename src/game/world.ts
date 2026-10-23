@@ -208,9 +208,37 @@ export class VoxelWorld {
     if (biome === 'desert') {
       h = Math.floor(16 + n1 * 0.6 + n2 * 0.5);
     }
+
+    // Flatten terrain around Village Centers so village houses sit cleanly on flat ground
+    for (const v of VoxelWorld.VILLAGE_CENTERS) {
+      const dist = Math.hypot(wx - v.x, wz - v.z);
+      if (dist < 16) {
+        h = v.baseY;
+        biome = v.biome;
+        break;
+      } else if (dist < 22) {
+        const t = (dist - 16) / 6;
+        h = Math.round(v.baseY * (1 - t) + h * t);
+        break;
+      }
+    }
+
     h = Math.max(4, Math.min(CHUNK_HEIGHT - 12, h));
     return { height: h, biome };
   }
+
+  public static readonly VILLAGE_CENTERS: {
+    id: string;
+    nameRu: string;
+    x: number;
+    z: number;
+    baseY: number;
+    biome: 'plains' | 'desert' | 'snow' | 'forest';
+  }[] = [
+    { id: 'v_north', nameRu: 'Северная Деревня', x: 40, z: -40, baseY: 18, biome: 'plains' },
+    { id: 'v_west', nameRu: 'Лесная Деревня', x: -48, z: 32, baseY: 19, biome: 'forest' },
+    { id: 'v_south', nameRu: 'Южная Застава', x: 24, z: 56, baseY: 18, biome: 'plains' },
+  ];
 
   public generateChunkData(cx: number, cz: number): Uint8Array {
     const key = `${cx},${cz}`;
@@ -220,6 +248,13 @@ export class VoxelWorld {
     const data = new Uint8Array(CHUNK_SIZE * CHUNK_HEIGHT * CHUNK_SIZE);
     const startX = cx * CHUNK_SIZE;
     const startZ = cz * CHUNK_SIZE;
+
+    const isInsideVillageZone = (wx: number, wz: number) => {
+      for (const v of VoxelWorld.VILLAGE_CENTERS) {
+        if (Math.hypot(wx - v.x, wz - v.z) < 17) return true;
+      }
+      return false;
+    };
 
     for (let lx = 0; lx < CHUNK_SIZE; lx++) {
       for (let lz = 0; lz < CHUNK_SIZE; lz++) {
@@ -233,12 +268,10 @@ export class VoxelWorld {
           if (ly === 0) {
             blockId = BlockId.BEDROCK;
           } else if (ly < height - 3) {
-            // Check caves
             const cave = this.caveNoise3D(wx * 0.06, ly * 0.08, wz * 0.06);
             if (ly > 3 && cave > 0.66) {
               blockId = BlockId.AIR;
             } else {
-              // Ores distribution
               const oreNoise = this.caveNoise3D(wx * 0.22 + 100, ly * 0.22, wz * 0.22);
               if (oreNoise > 0.76 && ly < 12) {
                 blockId = BlockId.DIAMOND_ORE;
@@ -273,13 +306,130 @@ export class VoxelWorld {
       }
     }
 
-    // Second pass within chunk: deterministic trees (kept inside 2..13 margin so they don't clip across chunks)
+    // Helper to set a block if its world coordinate falls within this chunk
+    const setWorldVoxelInChunk = (wx: number, wy: number, wz: number, id: BlockId) => {
+      if (wy < 0 || wy >= CHUNK_HEIGHT) return;
+      const lx = wx - startX;
+      const lz = wz - startZ;
+      if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) {
+        data[this.getLocalIndex(lx, wy, lz)] = id;
+      }
+    };
+
+    // Build Village Houses, Paths, Wells, and Treasure Chests if chunk overlaps a village
+    for (const v of VoxelWorld.VILLAGE_CENTERS) {
+      if (Math.abs(startX + 8 - v.x) > 28 || Math.abs(startZ + 8 - v.z) > 28) continue;
+
+      const by = v.baseY;
+
+      // Cobblestone crossroads path + central glowing well
+      for (let px = v.x - 12; px <= v.x + 12; px++) {
+        for (let pz = v.z - 1; pz <= v.z + 1; pz++) {
+          setWorldVoxelInChunk(px, by, pz, BlockId.COBBLESTONE);
+        }
+      }
+      for (let pz = v.z - 12; pz <= v.z + 12; pz++) {
+        for (let px = v.x - 1; px <= v.x + 1; px++) {
+          setWorldVoxelInChunk(px, by, pz, BlockId.COBBLESTONE);
+        }
+      }
+
+      // Central Village Well / Lamp Post at (v.x, v.z)
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          if (dx === 0 && dz === 0) {
+            setWorldVoxelInChunk(v.x, by, v.z, BlockId.WATER);
+          } else {
+            setWorldVoxelInChunk(v.x + dx, by + 1, v.z + dz, BlockId.COBBLESTONE);
+          }
+        }
+      }
+      setWorldVoxelInChunk(v.x - 1, by + 2, v.z - 1, BlockId.OAK_LOG);
+      setWorldVoxelInChunk(v.x + 1, by + 2, v.z - 1, BlockId.OAK_LOG);
+      setWorldVoxelInChunk(v.x - 1, by + 2, v.z + 1, BlockId.OAK_LOG);
+      setWorldVoxelInChunk(v.x + 1, by + 2, v.z + 1, BlockId.OAK_LOG);
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          setWorldVoxelInChunk(v.x + dx, by + 3, v.z + dz, BlockId.OAK_PLANKS);
+        }
+      }
+      setWorldVoxelInChunk(v.x, by + 3, v.z, BlockId.GLOWSTONE);
+
+      // Build 3 Enterable Village Houses around the square
+      const houses = [
+        { hx: v.x - 8, hz: v.z - 8, doorSide: 'south' as const, hasChest: true },
+        { hx: v.x + 3, hz: v.z - 8, doorSide: 'south' as const, hasChest: false },
+        { hx: v.x - 8, hz: v.z + 3, doorSide: 'north' as const, hasChest: true },
+      ];
+
+      for (const h of houses) {
+        const w = 6;
+        const d = 6;
+        const wallH = 4;
+
+        for (let dx = 0; dx < w; dx++) {
+          for (let dz = 0; dz < d; dz++) {
+            const wx = h.hx + dx;
+            const wz = h.hz + dz;
+
+            // Cobblestone floor
+            setWorldVoxelInChunk(wx, by, wz, BlockId.COBBLESTONE);
+
+            // Clear interior air
+            for (let dy = 1; dy <= wallH; dy++) {
+              setWorldVoxelInChunk(wx, by + dy, wz, BlockId.AIR);
+            }
+
+            const isEdgeX = dx === 0 || dx === w - 1;
+            const isEdgeZ = dz === 0 || dz === d - 1;
+            const isCorner = isEdgeX && isEdgeZ;
+
+            if (isEdgeX || isEdgeZ) {
+              for (let dy = 1; dy <= wallH - 1; dy++) {
+                // Check if doorway position (middle of front wall, 2 blocks high: dy=1 and dy=2)
+                const isSouthDoor = h.doorSide === 'south' && dz === d - 1 && dx === 3 && (dy === 1 || dy === 2);
+                const isNorthDoor = h.doorSide === 'north' && dz === 0 && dx === 3 && (dy === 1 || dy === 2);
+
+                if (isSouthDoor || isNorthDoor) {
+                  setWorldVoxelInChunk(wx, by + dy, wz, BlockId.DOOR_CLOSED);
+                } else if (isCorner) {
+                  setWorldVoxelInChunk(wx, by + dy, wz, BlockId.OAK_LOG);
+                } else if (dy === 2 && (dx === 2 || dz === 2 || dz === 3)) {
+                  setWorldVoxelInChunk(wx, by + dy, wz, BlockId.GLASS);
+                } else {
+                  setWorldVoxelInChunk(wx, by + dy, wz, BlockId.OAK_PLANKS);
+                }
+              }
+            }
+
+            // Pitched Wooden Roof
+            const roofDist = Math.min(dx, w - 1 - dx, dz, d - 1 - dz);
+            setWorldVoxelInChunk(wx, by + wallH + (roofDist > 0 ? 1 : 0), wz, BlockId.OAK_PLANKS);
+            if (roofDist === 0) {
+              setWorldVoxelInChunk(wx, by + wallH, wz, BlockId.OAK_LOG);
+            } else {
+              setWorldVoxelInChunk(wx, by + wallH, wz, BlockId.AIR);
+            }
+          }
+        }
+
+        // Interior furnishings: Glowstone lamp, Bookshelf, Crafting Table, and Treasure Chest
+        setWorldVoxelInChunk(h.hx + 1, by + 1, h.hz + 1, BlockId.CRAFTING_TABLE);
+        setWorldVoxelInChunk(h.hx + 4, by + 1, h.hz + 1, BlockId.BOOKSHELF);
+        setWorldVoxelInChunk(h.hx + 4, by + 2, h.hz + 1, BlockId.GLOWSTONE);
+        if (h.hasChest) {
+          setWorldVoxelInChunk(h.hx + 1, by + 1, h.hz + 4, BlockId.TREASURE_CHEST);
+        }
+      }
+    }
+
+    // Second pass within chunk: deterministic trees (kept outside villages and spawn)
     for (let lx = 2; lx < CHUNK_SIZE - 2; lx++) {
       for (let lz = 2; lz < CHUNK_SIZE - 2; lz++) {
         const wx = startX + lx;
         const wz = startZ + lz;
-        // Keep spawn area (near 0,0) clear and scenic with a crafting table
-        if (Math.abs(wx) < 4 && Math.abs(wz) < 4) continue;
+        if (Math.abs(wx) < 5 && Math.abs(wz) < 5) continue;
+        if (isInsideVillageZone(wx, wz)) continue;
 
         const { height, biome } = this.getTerrainHeight(wx, wz);
         if (height <= WATER_LEVEL + 1 || biome === 'desert') continue;
@@ -297,7 +447,6 @@ export class VoxelWorld {
             }
           }
 
-          // Leaf canopy
           for (let dy = trunkHeight - 1; dy <= trunkHeight + 1; dy++) {
             const radius = dy === trunkHeight + 1 ? 1 : 2;
             for (let dx = -radius; dx <= radius; dx++) {
@@ -326,7 +475,7 @@ export class VoxelWorld {
       }
     }
 
-    // Place a starter Crafting Table and Furnace right next to spawn (3, height+1, 0)
+    // Place a starter Crafting Table and Furnace right next to spawn (3, height+1, 3)
     if (cx === 0 && cz === 0) {
       const hCraft = this.getTerrainHeight(3, 3).height;
       if (hCraft > WATER_LEVEL) {
@@ -372,6 +521,7 @@ export class VoxelWorld {
   public isSolidBlock(wx: number, wy: number, wz: number): boolean {
     const id = this.getBlock(wx, wy, wz);
     if (id === BlockId.AIR || id === BlockId.WATER) return false;
+    if (BLOCKS[id]?.passable) return false;
     return true;
   }
 

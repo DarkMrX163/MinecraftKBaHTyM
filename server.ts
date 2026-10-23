@@ -63,6 +63,37 @@ const PROJECT_EXPORT_FILES = [
   'src/game/network.ts',
 ];
 
+function collectDistFiles(dir: string, prefix = 'docs'): Record<string, { content: string; isBase64: boolean }> {
+  const results: Record<string, { content: string; isBase64: boolean }> = {};
+  if (!fs.existsSync(dir)) return results;
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    // Skip user uploaded debug screenshots in public/assets/aistudio
+    if (entry.name === 'aistudio') continue;
+    const fullPath = path.join(dir, entry.name);
+    const relPath = `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      Object.assign(results, collectDistFiles(fullPath, relPath));
+    } else {
+      const ext = path.extname(entry.name).toLowerCase();
+      const isText = ['.html', '.js', '.css', '.json', '.svg', '.txt', '.map'].includes(ext);
+      if (isText) {
+        results[relPath] = {
+          content: fs.readFileSync(fullPath, 'utf-8'),
+          isBase64: false,
+        };
+      } else {
+        results[relPath] = {
+          content: fs.readFileSync(fullPath).toString('base64'),
+          isBase64: true,
+        };
+      }
+    }
+  }
+  return results;
+}
+
 function collectProjectFiles(): Record<string, string> {
   const result: Record<string, string> = {};
   for (const relPath of PROJECT_EXPORT_FILES) {
@@ -75,66 +106,35 @@ function collectProjectFiles(): Record<string, string> {
       // ignore missing file
     }
   }
-  // Add GitHub Pages workflow so deployed repo auto-builds to GitHub Pages
-  result['.github/workflows/deploy.yml'] = `name: Deploy Minecraft Voxel Edition to GitHub Pages
 
-on:
-  push:
-    branches: ["main"]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Install dependencies
-        run: npm install
-      - name: Build static site
-        run: npx vite build --base=./
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: ./dist
-
-  deploy:
-    environment:
-      name: github-pages
-      url: \${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-`;
+  // Also include pre-built production bundle inside /docs so GitHub Pages works immediately from Branch (main /docs) without needing GitHub Actions or workflow token scope!
+  const distDir = path.join(__dirname, 'dist');
+  const distFiles = collectDistFiles(distDir, 'docs');
+  for (const [docPath, fileObj] of Object.entries(distFiles)) {
+    if (!fileObj.isBase64) {
+      result[docPath] = fileObj.content;
+    }
+  }
+  // Add .nojekyll in both root and docs/ so GitHub Pages skips Jekyll and serves all assets cleanly
+  result['.nojekyll'] = '';
+  result['docs/.nojekyll'] = '';
 
   result['README.md'] = `# Minecraft Voxel Edition (Cross-Platform Online)
 
 Точная браузерная 3D-копия Minecraft с собственным воксельным движком (Three.js), 16x16 пиксельными текстурами, системой крафта и кроссплатформенным мультиплеером в реальном времени (WebSocket + WebRTC P2P PeerJS для работы на GitHub Pages).
+
+## Как включить ссылку GitHub Pages (если открывается 404 или требуется настройка):
+В репозитории уже лежит готовая собранная игра в папке \`/docs\`!
+1. Откройте на GitHub вкладку **Settings** -> **Pages**.
+2. В разделе **Build and deployment** -> **Source** выберите **Deploy from a branch** (вместо GitHub Actions).
+3. Выберите ветку **\`main\`** и папку **\`/docs\`**, затем нажмите **Save**.
+4. Через 30 секунд ваша игра будет доступна по ссылке GitHub Pages!
 
 ## Запуск локально с сервером
 \`\`\`bash
 npm install
 npm run dev
 \`\`\`
-
-## Онлайн-игра на GitHub Pages
-Игра автоматически использует **WebRTC P2P (PeerJS)** и **WebSocket**, поэтому вы можете играть с друзьями напрямую по ссылке на GitHub Pages без отдельного выделенного сервера: просто введите одинаковый код комнаты и отправьте ссылку другу!
 `;
   return result;
 }
@@ -204,7 +204,7 @@ async function startServer() {
     res.json({ files: collectProjectFiles() });
   });
 
-  // API endpoint to create a GitHub repository and push all game files directly
+  // API endpoint to create a GitHub repository and push all game files + prebuilt /docs bundle directly via Git Data Tree API (1 single fast commit!)
   app.post('/api/github/publish', async (req, res) => {
     try {
       const { token, repoName, description, isPrivate } = req.body || {};
@@ -212,7 +212,7 @@ async function startServer() {
         res.status(400).json({ error: 'Укажите Personal Access Token (PAT) от GitHub' });
         return;
       }
-      const cleanRepo = String(repoName || 'minecraft-voxel-online')
+      const cleanRepo = String(repoName || 'MinecraftKBaHTyM')
         .trim()
         .replace(/[^a-zA-Z0-9._-]/g, '-');
 
@@ -236,6 +236,7 @@ async function startServer() {
 
       // 2. Check if repo exists or create it
       let repoUrl = `https://github.com/${owner}/${cleanRepo}`;
+      let defaultBranch = 'main';
       const checkRes = await fetch(`https://api.github.com/repos/${owner}/${cleanRepo}`, { headers });
       if (!checkRes.ok) {
         const createRes = await fetch('https://api.github.com/user/repos', {
@@ -253,54 +254,126 @@ async function startServer() {
           res.status(400).json({ error: `Не удалось создать репозиторий: ${errData.slice(0, 180)}` });
           return;
         }
-        const createdRepo = (await createRes.json()) as { html_url: string };
+        const createdRepo = (await createRes.json()) as { html_url: string; default_branch?: string };
         repoUrl = createdRepo.html_url;
-        // Brief pause for GitHub initial commit initialization
+        if (createdRepo.default_branch) defaultBranch = createdRepo.default_branch;
         await new Promise((r) => setTimeout(r, 1200));
+      } else {
+        const existingRepo = (await checkRes.json()) as { default_branch?: string };
+        if (existingRepo.default_branch) defaultBranch = existingRepo.default_branch;
       }
 
-      // 3. Push project files via GitHub Contents API
+      // 3. Collect all source files + prebuilt /docs static bundle (works without workflow scope!)
       const files = collectProjectFiles();
       let uploadedCount = 0;
 
-      for (const [filePath, content] of Object.entries(files)) {
-        // Check if file already exists to get its SHA
-        let sha: string | undefined;
-        const existingFileRes = await fetch(
-          `https://api.github.com/repos/${owner}/${cleanRepo}/contents/${filePath}`,
-          { headers }
-        );
-        if (existingFileRes.ok) {
-          const existingJson = (await existingFileRes.json()) as { sha?: string };
-          sha = existingJson.sha;
-        }
+      // Try fast single-commit Git Tree API first, fallback to Contents API
+      const refRes = await fetch(
+        `https://api.github.com/repos/${owner}/${cleanRepo}/git/ref/heads/${defaultBranch}`,
+        { headers }
+      );
 
-        const putRes = await fetch(
-          `https://api.github.com/repos/${owner}/${cleanRepo}/contents/${filePath}`,
-          {
-            method: 'PUT',
-            headers,
-            body: JSON.stringify({
-              message: `Update ${filePath} — Minecraft Voxel Edition`,
-              content: Buffer.from(content, 'utf-8').toString('base64'),
-              ...(sha ? { sha } : {}),
-            }),
+      if (refRes.ok) {
+        const refData = (await refRes.json()) as { object: { sha: string } };
+        const latestCommitSha = refData.object.sha;
+
+        const treeItems = Object.entries(files).map(([filePath, content]) => ({
+          path: filePath,
+          mode: '100644',
+          type: 'blob',
+          content,
+        }));
+
+        const treeRes = await fetch(`https://api.github.com/repos/${owner}/${cleanRepo}/git/trees`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            base_tree: latestCommitSha,
+            tree: treeItems,
+          }),
+        });
+
+        if (treeRes.ok) {
+          const treeData = (await treeRes.json()) as { sha: string };
+          const commitRes = await fetch(
+            `https://api.github.com/repos/${owner}/${cleanRepo}/git/commits`,
+            {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({
+                message: 'Deploy Minecraft Voxel Edition (Source + Prebuilt /docs for GitHub Pages)',
+                tree: treeData.sha,
+                parents: [latestCommitSha],
+              }),
+            }
+          );
+
+          if (commitRes.ok) {
+            const commitData = (await commitRes.json()) as { sha: string };
+            await fetch(
+              `https://api.github.com/repos/${owner}/${cleanRepo}/git/refs/heads/${defaultBranch}`,
+              {
+                method: 'PATCH',
+                headers,
+                body: JSON.stringify({ sha: commitData.sha, force: true }),
+              }
+            );
+            uploadedCount = treeItems.length;
           }
-        );
-
-        if (putRes.ok) {
-          uploadedCount++;
         }
       }
 
-      // 4. Attempt to enable GitHub Pages (workflow build type)
-      await fetch(`https://api.github.com/repos/${owner}/${cleanRepo}/pages`, {
+      // Fallback if Tree API didn't run
+      if (uploadedCount === 0) {
+        for (const [filePath, content] of Object.entries(files)) {
+          let sha: string | undefined;
+          const existingFileRes = await fetch(
+            `https://api.github.com/repos/${owner}/${cleanRepo}/contents/${filePath}`,
+            { headers }
+          );
+          if (existingFileRes.ok) {
+            const existingJson = (await existingFileRes.json()) as { sha?: string };
+            sha = existingJson.sha;
+          }
+
+          const putRes = await fetch(
+            `https://api.github.com/repos/${owner}/${cleanRepo}/contents/${filePath}`,
+            {
+              method: 'PUT',
+              headers,
+              body: JSON.stringify({
+                message: `Update ${filePath}`,
+                content: Buffer.from(content, 'utf-8').toString('base64'),
+                ...(sha ? { sha } : {}),
+              }),
+            }
+          );
+          if (putRes.ok) uploadedCount++;
+        }
+      }
+
+      // 4. Configure GitHub Pages to deploy directly from branch `main` folder `/docs` (Create or Update)
+      const pagesConfigBody = JSON.stringify({
+        source: {
+          branch: defaultBranch,
+          path: '/docs',
+        },
+      });
+
+      const createPagesRes = await fetch(`https://api.github.com/repos/${owner}/${cleanRepo}/pages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-          build_type: 'workflow',
-        }),
-      }).catch(() => {});
+        body: pagesConfigBody,
+      });
+
+      if (!createPagesRes.ok) {
+        // If Pages is already enabled (e.g. set to GitHub Actions), switch it to Branch main /docs via PUT
+        await fetch(`https://api.github.com/repos/${owner}/${cleanRepo}/pages`, {
+          method: 'PUT',
+          headers,
+          body: pagesConfigBody,
+        }).catch(() => {});
+      }
 
       const pagesUrl = `https://${owner.toLowerCase()}.github.io/${cleanRepo}/`;
       res.json({

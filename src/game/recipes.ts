@@ -26,6 +26,18 @@ export const CRAFTING_RECIPES: CraftingRecipe[] = [
     output: { blockId: BlockId.OAK_PLANKS, count: 4 },
   },
   {
+    id: 'oak_door_craft',
+    nameRu: 'Деревянная дверь (x2)',
+    inputs: [{ blockId: BlockId.OAK_PLANKS, count: 6 }],
+    output: { blockId: BlockId.DOOR_CLOSED, count: 2 },
+  },
+  {
+    id: 'chest_craft',
+    nameRu: 'Сундук сокровищ',
+    inputs: [{ blockId: BlockId.OAK_PLANKS, count: 8 }],
+    output: { blockId: BlockId.TREASURE_CHEST, count: 1 },
+  },
+  {
     id: 'crafting_table',
     nameRu: 'Верстак',
     inputs: [{ blockId: BlockId.OAK_PLANKS, count: 4 }],
@@ -97,7 +109,7 @@ export const INITIAL_HOTBAR: InventorySlot[] = [
   { blockId: BlockId.GRASS, count: 64 },
   { blockId: BlockId.COBBLESTONE, count: 64 },
   { blockId: BlockId.OAK_PLANKS, count: 64 },
-  { blockId: BlockId.OAK_LOG, count: 32 },
+  { blockId: BlockId.DOOR_CLOSED, count: 8 },
   { blockId: BlockId.GLASS, count: 32 },
   { blockId: BlockId.BRICK, count: 32 },
   { blockId: BlockId.GLOWSTONE, count: 16 },
